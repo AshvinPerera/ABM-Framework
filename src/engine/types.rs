@@ -1,3 +1,7 @@
+use std::any::Any;
+use std::collections::HashMap;
+
+
 pub type Bits = u8;
 
 pub type EntityID = u64;
@@ -76,4 +80,47 @@ pub fn build_signature(component_ids: &[ComponentID]) -> Signature {
     let mut signature = Signature::default();
     for &component_id in component_ids { signature.set(component_id); }
     signature
+}
+
+pub trait DynamicBundle {
+    fn take(&mut self, component_id: ComponentID) -> Option<Box<dyn Any>>;
+}
+
+pub struct Bundle {
+    values: Vec<Option<Box<dyn Any>>>,
+}
+
+impl Bundle {
+    pub fn with_len(length: usize) -> Self {
+        Self { values: vec![None; length] }
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        for value in &mut self.values { *value = None; }
+    }
+
+    #[inline]
+    pub fn insert<T: Any>(&mut self, component_id: ComponentID, value: T) {
+        self.values[component_id as usize] = Some(Box::new(value));
+    }
+
+    #[inline]
+    pub fn extend_from_iter<T: Any, I: IntoIterator<Item = (ComponentID, T)>>(&mut self, iter: I) {
+        for (component_id, value) in iter {
+            self.insert(component_id, value);
+        }
+    }
+
+    #[inline]
+    pub fn is_complete_for(&self, required: &[bool]) -> bool {
+        required.iter().enumerate().all(|(i, req)| !*req || self.values[i].is_some())
+    }
+}
+
+impl DynamicBundle for Bundle {
+    #[inline]
+    fn take(&mut self, component_id: ComponentID) -> Option<Box<dyn Any>> {
+        self.values.get_mut(component_id as usize).and_then(|slot| slot.take())
+    }
 }

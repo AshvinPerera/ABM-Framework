@@ -6,10 +6,12 @@ use crate::types::{
     CHUNK_CAP, 
     ComponentID, 
     COMPONENT_CAP,
-    Signature
+    Signature,
+    DynamicBundle
 };
 use crate::storage::{
-    TypeErasedAttribute
+    TypeErasedAttribute,
+    Attribute
 };
 use crate::entity::{
     Entity, 
@@ -94,27 +96,58 @@ impl Archetype {
         taken
     }
 
-    pub fn spawn_on(&mut self, shards: &mut EntityShards, shard_id: ShardID) -> Result<Entity, SpawnError> {
+    pub fn spawn_on(&mut self, shards: &mut EntityShards, shard_id: ShardID, mut values: impl DynBundle) -> Result<Entity, SpawnError> {
+        let mut written_index: Vec<usize> = Vec::new();
         let mut reference_position: Option<(ChunkID, RowID)> = None;
 
-        for component in self.components.iter_mut().filter_map(|c| c.as_mut()) {
-            let position = match component.push_dyn(Box::new(())) {
-                Ok(p) => p,
-                Err(_) => {
-                    if let Some((chunk, row)) = reference_position {
-                        for c in self.components.iter_mut().filter_map(|c| c.as_mut()) {
-                            let _ = c.swap_remove(chunk, row);
+        for (index, component_option) in self.components.iter_mut().enumerate() {
+            let Some(component) = component_option.as_mut() else { continue };
+
+            let component_id = index as ComponentID;
+
+            let type_id = component.element_type_id();
+            let name = component.element_type_name();
+
+            let Some(value) = bundle.take(component_id) else {
+                if let Some((c, r)) = reference_position {
+                    for &j in &written_ix {
+                        if let Some(s) = self.components[j].as_mut() {
+                            let _ = s.swap_remove(c, r);
                         }
                     }
-                    return Err(SpawnError::StoragePushFailed);
+                }
+                return Err(SpawnError::MissingComponent { type_id, name });
+            };
+
+            let position = match component.push_dyn(value) {
+                Ok(p) => p,
+                Err(e) => {
+                    if let Some((c, r)) = reference_position {
+                        for &j in &written_index {
+                            if let Some(s) = self.components[j].as_mut() {
+                                let _ = s.swap_remove(c, r);
+                            }
+                        }
+                    }
+                    return Err(SpawnError::StoragePushFailedWith(e));
                 }
             };
 
             if let Some(rp) = reference_position {
-                assert_eq!(position, rp, "attributes must stay aligned per row.");
+                debug_assert_eq!(position, rp, "attributes must stay aligned per row.");
+                if position != rp {
+                    for &j in &written_index {
+                        if let Some(s) = self.components[j].as_mut() {
+                            let _ = s.swap_remove(rp.0, rp.1);
+                        }
+                    }
+                    return Err(SpawnError::MisalignedStorage { expected: rp, got: position });
+                }
             } else {
                 reference_position = Some(position);
             }
+
+            written_index.push(index);
         }
 
         let Some((chunk, row)) = reference_position else {
@@ -125,18 +158,19 @@ impl Archetype {
 
         debug_assert!(
             self.entity_positions[chunk as usize][row as usize].is_none(),
-            "spawn_on: target entity slot is already occupied."
+            "spawn_on_bundle: target entity slot is already occupied."
         );
 
         let location = EntityLocation { archetype: self.archetype_id, chunk, row };
-
         let entity = match shards.spawn_on(shard_id, location) {
             Ok(e) => e,
-            Err(err) => {
-                for component in self.components.iter_mut().filter_map(|c| c.as_mut()) {
-                    let _ = component.swap_remove(chunk, row);
+            Err(_err) => {
+                for &j in &written_index {
+                    if let Some(s) = self.components[j].as_mut() {
+                        let _ = s.swap_remove(chunk, row);
+                    }
                 }
-                return Err(err);
+                return Err(SpawnError::ShardError);
             }
         };
 
@@ -220,5 +254,5 @@ impl Archetype {
 }
 
 fn make_empty_component_for(_component_id: ComponentID) -> Box<dyn TypeErasedAttribute> {
-    Box::new(crate::storage::Attribute::<()>::new())
+    Box::new(Attribute::<()>::new())
 }

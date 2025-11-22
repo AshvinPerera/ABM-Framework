@@ -23,6 +23,7 @@ pub trait TypeErasedAttribute: Any + Send + Sync {
 
     fn swap_remove(&mut self, chunk: ChunkID, row: RowID) -> Result<Option<(ChunkID, RowID)>, AttributeError>;
     fn push_dyn(&mut self, value: Box<dyn Any>) -> Result<(ChunkID, RowID), AttributeError>;
+    fn push_from(&mut self, source: &mut dyn TypeErasedAttribute, source_chunk: ChunkID, source_row: RowID) -> ((ChunkID, RowID), Option<(ChunkID, RowID)>);
 }
 
 /// Invariant:
@@ -90,6 +91,10 @@ impl<T> Attribute<T> {
         Some((index / CHUNK_CAP, index % CHUNK_CAP))
     }
 
+    pub fn reserve_chunks(&mut self, additional: usize) {
+        self.chunks.reserve(additional);
+    }  
+
     pub fn get(&self, chunk: ChunkID, row: RowID) -> Option<&T> {
         if !self.valid_position(chunk, row) { return None; }
         Some(unsafe { self.chunks[chunk as usize][row as usize].assume_init_ref() })
@@ -100,19 +105,30 @@ impl<T> Attribute<T> {
         Some(unsafe { self.chunks[chunk as usize][row as usize].assume_init_mut() })
     }
 
-    pub fn push(&mut self, v: T) -> Result<(ChunkID, RowID), AttributeError> {
+    pub fn push(&mut self, value: T) -> Result<(ChunkID, RowID), AttributeError> {
         self.ensure_last_chunk();
+        let chunk_index = self.chunks.len() - 1;
+        let row_index   = self.last_chunk_length;
 
-        let chunk_us = self.chunks.len() - 1;
-        let row_us   = self.last_chunk_length;
+        if chunk_index > ChunkID::MAX as usize || row_index > RowID::MAX as usize {
+            if row_index == 0 {
+                self.chunks.pop();
+                if let Some(last_chunk) = self.chunks.last() {
+                    self.last_chunk_length = CHUNK_CAP;
+                }
+            }
+            return Err(AttributeError::IndexOverflow("ChunkID"));
+        }
 
-        // Safety: slot exists and is currently uninitialized
-        unsafe { self.get_slot_unchecked(chunk_us, row_us).as_mut_ptr().write(v); }
-
+        unsafe {
+            self.get_slot_unchecked(chunk_index, row_index)
+                .as_mut_ptr()
+                .write(value);
+        }
         self.last_chunk_length += 1;
         self.length += 1;
 
-        let (chunk_id, row_id) = Self::to_ids(chunk_us, row_us)?;
+        let (chunk_id, row_id) = Self::to_ids(chunk_index, row_index)?;
         Ok((chunk_id, row_id))
     }
 
@@ -165,7 +181,7 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
     fn element_type_name(&self) -> &'static str {type_name::<T>()}
 
     fn swap_remove(&mut self, chunk: ChunkID, row: RowID) -> Result<Option<(ChunkID, RowID)>, AttributeError> {
-        let Some((last_chunk_us, last_row_us)) = self.last_filled_position() else {
+        let Some((last_chunk_index, last_row_index)) = self.last_filled_position() else {
             return Err(AttributeError::Position(PositionOutOfBoundsError {
                 chunk,
                 row,
@@ -188,8 +204,8 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
         let c = chunk as usize;
         let r = row as usize;
 
-        if last_chunk_us == c && last_row_us == r {
-            unsafe { self.get_slot_unchecked(last_chunk_us, last_row_us).assume_init_drop(); }
+        if last_chunk_index == c && last_row_index == r {
+            unsafe { self.get_slot_unchecked(last_chunk_index, last_row_index).assume_init_drop(); }
             self.length -= 1;
             self.last_chunk_length -= 1;
 
@@ -202,10 +218,10 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
             return Ok(None);
         } else {
             unsafe {
-                let a = self.get_slot_unchecked(c, r).as_mut_ptr();
-                let b = self.get_slot_unchecked(last_chunk_us, last_row_us).as_mut_ptr();
-                ptr::swap(a, b);
-                self.get_slot_unchecked(last_chunk_us, last_row_us).assume_init_drop();
+                let dst_ptr = self.chunks.get_unchecked(c).as_ptr().add(r);
+                let src_ptr = self.chunks.get_unchecked(last_chunk_index).as_ptr().add(last_row_index);
+                ptr::swap(dst_ptr as *mut T, src_ptr as *mut T);
+                src_ptr.cast::<MaybeUninit<T>>().write(MaybeUninit::uninit());
             }
 
             self.length -= 1;
@@ -217,7 +233,7 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
                 }
             }
 
-            let moved_from = Self::to_ids(last_chunk_us, last_row_us)?;
+            let moved_from = Self::to_ids(last_chunk_index, last_row_index)?;
             return Ok(Some(moved_from));
         }
     }
@@ -229,6 +245,21 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
         let expected = type_name::<T>();
         let actual = type_name_of_val(&*value);
         Err(AttributeError::TypeMismatch(TypeMismatchError { expected, actual }))
+    }
+
+    fn push_from(&mut self, source: &mut dyn TypeErasedAttribute, source_chunk: ChunkID, source_row: RowID) -> ((ChunkID, RowID), Option<(ChunkID, RowID)>) {
+        let source = source.as_any_mut()
+            .downcast_mut::<Attribute<T>>()
+            .expect("component type mismatch between columns.");
+
+        let value: T = unsafe {
+            source.get_mut(source_chunk, source_row).assume_init_read()
+        };
+
+        let (destination_chunk, destination_row) = self.push_dyn(Box::new(value));
+        let moved_from_last = source.swap_remove(source_chunk, source_row);
+
+        ((destination_chunk, destination_row), moved_from_last)
     }
 }
 
