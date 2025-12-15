@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use crate::types::{
     ArchetypeID, 
     ShardID,
@@ -6,25 +8,39 @@ use crate::types::{
     CHUNK_CAP, 
     ComponentID, 
     COMPONENT_CAP,
+    SIGNATURE_SIZE,
     Signature,
-    DynamicBundle
+    DynamicBundle,
+    iter_bits_from_words,
 };
+
 use crate::storage::{
-    TypeErasedAttribute,
-    Attribute
+    TypeErasedAttribute
 };
+
 use crate::entity::{
     Entity, 
     EntityLocation, 
     EntityShards
 };
+
 use crate::component::{ 
     component_id_of_type_id,
     get_component_storage_factory
 };
+
 use crate::error::{
-    SpawnError
+    SpawnError,
+    MoveError
 };
+
+
+pub struct ChunkBorrow<'a> {
+    pub length: usize,
+    pub reads: Vec<&'a [u8]>,
+    pub writes: Vec<*mut u8>,
+    pub _marker: std::marker::PhantomData<&'a mut u8>
+}
 
 //! # Archetype
 //!
@@ -49,7 +65,7 @@ use crate::error::{
 //!
 //! - All component attributes in an archetype share identical row counts.
 //! - Component presence is determined solely by the archetype's `Signature`.
-//! - Any row movement (via `push_from`, `swap_remove`, or despawn) must update
+//! - Any row movement (via `push_from`, `swap_remove`, or de-spawn) must update
 //!   `entity_positions` to remain consistent with component storage.
 //!
 //! Violating these invariants results in undefined entity/component alignment.
@@ -62,7 +78,7 @@ use crate::error::{
 //! - Missing components in a bundle during spawn.
 //! - Storage push failures.
 //! - Misaligned writes during spawn or move.
-//! - Despawning stale or untracked entities.
+//! - De-spawning stale or untracked entities.
 //!
 //! ## Summary
 //!
@@ -70,12 +86,6 @@ use crate::error::{
 //! entities in the ECS. Its chunked, columnar design ensures locality, fast
 //! traversal, predictable memory behavior, and compatibility with CPU/GPU
 //! parallelization strategies.
-
-pub struct ChunkBorrow<'a> {
-    pub length: usize,
-    pub reads: Vec<&'a [u8]>,
-    pub writes: Vec<*mut u8>
-}
 
 #[derive(Debug)]
 pub struct Archetype {
@@ -102,7 +112,7 @@ impl Archetype {
     /// ## Invariants
     /// The archetype contains no entities upon creation.
 
-    fn new(archetype_id: ArchetypeID) -> Self {
+    pub fn new(archetype_id: ArchetypeID) -> Self {
             Self {
                 archetype_id,
                 components: vec![None; COMPONENT_CAP], // fixed-size component attribute slots
@@ -130,6 +140,22 @@ impl Archetype {
         self.archetype_id 
     }
 
+    /// Returns a reference to the archetype's signature.
+    ///
+    /// ## Notes
+    /// Used by query and filtering logic.
+
+    pub fn signature(&self) -> &Signature { &self.signature }
+
+    /// Returns `true` if this archetype contains all components described in `need`.
+    ///
+    /// ## Notes
+    /// This performs a subset check using signature bits.
+
+    pub fn matches_all(&self, need: &Signature) -> bool {
+        self.signature.contains_all(need)
+    }
+
     /// Ensures that `entity_positions` contains at least `chunk_count` chunks.
     ///
     /// ## Purpose
@@ -146,30 +172,6 @@ impl Archetype {
         }
     }
 
-    /// Returns mutable references to matching component columns in this archetype
-    /// and another archetype.
-    ///
-    /// ## Purpose
-    /// Used when transferring a row between archetypes.
-    ///
-    /// ## Behavior
-    /// Returns `None` if either archetype is missing the requested component.
-    ///
-    /// ## Invariants
-    /// Both archetypes must share the component for a row transfer to be valid.
-
-    #[inline]
-    fn get_component_pair_mut<'a>(
-        &'a mut self,
-        other: &'a mut Archetype,
-        component_id: ComponentID
-    ) -> Option<(&'a mut Box<dyn TypeErasedAttribute>, &'a mut Box<dyn TypeErasedAttribute>)> {
-        // Returns matching component columns in both archetypes; used for row movement.
-        let component_a = self.components[component_id as usize].as_mut()?;
-        let component_b = other.components[component_id as usize].as_mut()?;
-        Some((component_a, component_b))
-    }
-
     /// Guarantees that a component attribute exists for the given `component_id`.
     ///
     /// ## Behavior
@@ -180,12 +182,16 @@ impl Archetype {
     /// Attribute allocation and signature must remain consistent.
 
     #[inline]
-    pub fn ensure_component(&mut self, component_id: ComponentID, factory: impl FnOnce() -> Box<dyn TypeErasedAttribute>) {
+    pub fn ensure_component(&mut self, component_id: ComponentID, factory: impl FnOnce() -> Box<dyn TypeErasedAttribute>) -> Result<(), SpawnError>{
         // Lazily creates the column for a component type.
-        if self.components[component_id as usize].is_none() {
-            self.components[component_id as usize] = Some(factory());
+        let index = component_id as usize;
+        if index >= COMPONENT_CAP { return Err(SpawnError::InvalidComponentId); }
+
+        if self.components[index].is_none() {
+            self.components[index] = Some(factory());
             self.signature.set(component_id);
         }
+        Ok(())
     }
 
     /// Returns `true` if the archetype contains the specified component.
@@ -248,14 +254,16 @@ impl Archetype {
     /// Must reflect row count across all component attributes.
 
     pub fn chunk_valid_length(&self, chunk_index: usize) -> usize {
-        // Returns how many rows in a chunk contain valid entities.
-        if self.length == 0 || chunk_index > (self.length - 1) / CHUNK_CAP {
-            0
-        } else if chunk_index < (self.length - 1) / CHUNK_CAP {
+        let max_chunk = self.chunk_count().saturating_sub(1);
+
+        if chunk_index > max_chunk {
+            return 0;
+        }     
+        if chunk_index < max_chunk {
             CHUNK_CAP
         } else {
             let used = self.length % CHUNK_CAP;
-            if used == 0 { CHUNK_CAP } else { used } // possibly partial last chunk
+            if used == 0 { CHUNK_CAP } else { used }
         }
     }
 
@@ -295,147 +303,709 @@ impl Archetype {
     /// ## Invariants
     /// Removing attributes in a populated archetype would break row alignment.
 
-    pub fn remove_component(&mut self, component_id: ComponentID) -> Option<Box<dyn TypeErasedAttribute>> {
-        // Components cannot be removed while entities exist—would break row alignment.
+    pub fn remove_component(&mut self, component_id: ComponentID) -> Result<Option<Box<dyn TypeErasedAttribute>>, SpawnError> {
+        // Components cannot be removed while entities existï¿½would break row alignment.
         if self.length > 0 {
-            panic!("cannot remove a component from a non-empty archetype.");
+            return Err(SpawnError::ArchetypeNotEmpty);
         } 
 
         let index = component_id as usize;
-        let taken = self.components.get_mut(index)?.take();
-        if taken.is_some() {
-            self.signature.clear(component_id); // signature always matches stored columns
+        if index >= COMPONENT_CAP { 
+            return Err(SpawnError::InvalidComponentId); 
         }
-        taken
+
+        let taken = self.components[index].take();
+        if taken.is_some() { 
+            self.signature.clear(component_id); 
+        }
+        Ok(taken)
     }
 
-    /// Moves an entity's component row from this archetype to another.
-    ///
-    /// ## Purpose
-    /// Used when an entity changes signatures (adding or removing components).
-    ///
-    /// ## Behavior
-    /// - Copies shared components to the destination.
-    /// - Handles optional newly added component insertion.
-    /// - Updates both archetypes’ `entity_positions`.
-    /// - Applies `swap_remove` in the source to maintain compactness.
-    ///
-    /// ## Invariants
-    /// - Destination must contain all components being moved.
-    /// - All component attributes must agree on the row index of the moved entity.
-    /// - Row alignment must be preserved across all participating components.
-    ///
-    /// ## Failure
-    /// Panics internally if invariants are violated (storage inconsistency).
+    #[cfg(feature = "rollback")]
+    pub fn move_row_across_shared_components(
+        &mut self,
+        destination: &mut Archetype,
+        source_position: (ChunkID, RowID),
+        shared_components: Vec<ComponentID>
+    ) -> Result<((ChunkID, RowID), (ChunkID, RowID), Vec<(ComponentID, Box<dyn Any>)>), MoveError> 
+    {
+        let (source_chunk, source_row) = source_position;
+        let mut destination_position: Option<(ChunkID, RowID)> = None;
+        let mut swap_information: Option<(ChunkID, RowID)> = None;
+        let mut rollback_sequence: Vec<(ComponentID, Box<dyn Any>)> = Vec::new();
 
+        for component_id in shared_components {
+            if !self.signature.has(component_id) || !destination.signature.has(component_id) {
+                continue;
+            }
+
+            let source_component = match self.components[component_id as usize].as_mut() {
+                Some(c) => c,
+                None => {
+                    self.rollback_into(destination, rollback_sequence);
+                    return Err(MoveError::InconsistentStorage);
+                }
+            };
+
+            let destination_component = match destination.components[component_id as usize].as_mut() {
+                Some(c) => c,
+                None => {
+                    self.rollback_into(destination, rollback_sequence);
+                    return Err(MoveError::InconsistentStorage);
+                }
+            };
+
+            let ((destination_chunk, destination_row), moved_from, rollback) = 
+                match destination_component.push_from_dyn(source_component, source_chunk, source_row) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        self.rollback_into(destination, rollback_sequence);
+                        return Err(MoveError::PushFromFailed { component_id, source_error: e });
+                    }
+                };
+
+            match destination_position {
+                Some(position) if position != (destination_chunk, destination_row) => {
+                    self.rollback_into(destination, rollback_sequence);
+                    return Err(
+                        MoveError::RowMisalignment {
+                            expected: position,
+                            got: (destination_chunk, destination_row),
+                            component_id
+                        }
+                    );
+                }
+                
+                None => destination_position = Some((destination_chunk, destination_row)),
+                _ => {}
+            }
+
+            if let Some(moved_from_information) = moved_from {
+                match swap_information {
+                    Some(existing) if existing != moved_from_information => {
+                        self.rollback_into(destination, rollback_sequence);                        
+                        return Err(MoveError::InconsistentSwapInfo);
+                    }
+                    None => {
+                        swap_information = Some(moved_from_information);
+                    }
+                    _ => {}
+                }
+            }
+
+            rollback_sequence.push((component_id, rollback));
+        }
+
+        let destination_position = destination_position.ok_or(MoveError::NoComponentsMoved)?;
+
+        Ok((destination_position, swap_information, rollback_sequence))
+    }
+
+    #[cfg(not(feature = "rollback"))]
+    pub fn move_row_across_shared_components(
+        &mut self,
+        destination: &mut Archetype,
+        source_position: (ChunkID, RowID),
+        shared_components: Vec<ComponentID>
+    ) -> Result<((ChunkID, RowID), (ChunkID, RowID)), MoveError> 
+    {
+        let (source_chunk, source_row) = source_position;
+        let mut destination_position: Option<(ChunkID, RowID)> = None;
+        let mut swap_information: Option<(ChunkID, RowID)> = None;
+
+        for component_id in shared_components {
+            if !self.signature.has(component_id) || !destination.signature.has(component_id) {
+                continue;
+            }
+
+
+            let source_component = match self.components[component_id as usize].as_mut() {
+                Some(c) => c,
+                None => {
+                    return Err(MoveError::InconsistentStorage);
+                }
+            };
+
+            let destination_component = match destination.components[component_id as usize].as_mut() {
+                Some(c) => c,
+                None => {
+                    return Err(MoveError::InconsistentStorage);
+                }
+            };
+
+            let ((destination_chunk, destination_row), moved_from, rollback) = 
+                match destination_component.push_from_dyn(source_component, source_chunk, source_row) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        return Err(MoveError::PushFromFailed { component_id, source_error: e });
+                    }
+                };
+
+            match destination_position {
+                Some(position) if position != (destination_chunk, destination_row) => {
+                    return Err(
+                        MoveError::RowMisalignment {
+                            expected: position,
+                            got: (destination_chunk, destination_row),
+                            component_id
+                        }
+                    );
+                }
+                
+                None => destination_position = Some((destination_chunk, destination_row)),
+                _ => {}
+            }
+
+            if let Some(moved_from_information) = moved_from {
+                match swap_information {
+                    Some(existing) if existing != moved_from_information => {                   
+                        return Err(MoveError::InconsistentSwapInfo);
+                    }
+                    None => {
+                        swap_information = Some(moved_from_information);
+                    }
+                    _ => {}
+                }
+            }
+
+        }
+
+        let destination_position = destination_position.ok_or(MoveError::NoComponentsMoved)?;
+
+        Ok((destination_position, swap_information))
+    }
+
+    #[cfg(feature = "rollback")]
+    pub fn add_row_in_components_at_destination(
+        &mut self,
+        destination: &mut Archetype,
+        destination_position: (ChunkID, RowID),
+        added_components: Vec<(ComponentID, Box<dyn Any>)>,
+    ) -> Result<Vec<(ComponentID, Box<dyn Any>)>, MoveError> 
+    {
+        let mut rollback_sequence: Vec<(ComponentID, Box<dyn Any>)> = Vec::new();
+        let mut swap_information: Option<(ChunkID, RowID)> = None;
+        let (destination_chunk, destination_row) = destination_position;
+
+        for (component_id, value) in added_components {
+            if !destination.signature.has(component_id) {
+                continue;
+            }
+
+            let destination_component = match destination.components[component_id as usize].as_mut() {
+                Some(c) => c,
+                None => {
+                    self.rollback_into(destination, rollback_sequence);
+                    return Err(MoveError::InconsistentStorage);
+                }
+            };
+
+            let ((chunk, row), moved_from, rollback) = 
+                match destination_component.push_dyn(value) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        self.rollback_into(destination, rollback_sequence);
+                        return Err(MoveError::PushFailed { component_id, source_error: e });
+                    }
+                };
+
+            if (chunk, row) != (destination_chunk, destination_row) {
+                self.rollback_into(destination, rollback_sequence);
+                return Err(MoveError::RowMisalignment {
+                    expected: (destination_chunk, destination_row),
+                    got: (chunk, row),
+                    component_id,
+                });
+            }
+
+            if let Some(moved_from_information) = moved_from {
+                match swap_information {
+                    Some(existing) if existing != moved_from_information => {
+                        self.rollback_into(destination, rollback_sequence);                        
+                        return Err(MoveError::InconsistentSwapInfo);
+                    }
+                    None => {
+                        swap_information = Some(moved_from_information);
+                    }
+                    _ => {}
+                }
+            }            
+
+            rollback_sequence.push((component_id, rollback));
+        }
+
+        Ok(rollback_sequence)
+    }
+
+    #[cfg(not(feature = "rollback"))]
+    pub fn add_row_in_components_at_destination(
+        &mut self,
+        destination: &mut Archetype,
+        destination_position: (ChunkID, RowID),
+        added_components: Vec<(ComponentID, Box<dyn Any>)>,
+    ) -> Result<(), MoveError> 
+    {
+        let mut swap_information: Option<(ChunkID, RowID)> = None;
+        let (destination_chunk, destination_row) = destination_position;
+
+        for (component_id, value) in added_components {
+            if !destination.signature.has(component_id) {
+                continue;
+            }
+
+            let destination_component = match destination.components[component_id as usize].as_mut() {
+                Some(c) => c,
+                None => {
+                    return Err(MoveError::InconsistentStorage);
+                }
+            };
+
+            let ((chunk, row), moved_from, rollback) = 
+                match destination_component.push_dyn(value) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        return Err(MoveError::PushFailed { component_id, source_error: e });
+                    }
+                };
+
+            if (chunk, row) != (destination_chunk, destination_row) {
+                return Err(MoveError::RowMisalignment {
+                    expected: (destination_chunk, destination_row),
+                    got: (chunk, row),
+                    component_id,
+                });
+            }
+
+            if let Some(moved_from_information) = moved_from {
+                match swap_information {
+                    Some(existing) if existing != moved_from_information => {                      
+                        return Err(MoveError::InconsistentSwapInfo);
+                    }
+                    None => {
+                        swap_information = Some(moved_from_information);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "rollback")]    
+    pub fn remove_row_in_components_at_source(
+        &mut self,
+        source_position: (ChunkID, RowID),
+        removed_components: &[ComponentID],
+        source_swap_position: Option<(ChunkID, RowID)>
+    ) -> Result<Vec<(ComponentID, Box<dyn Any>)>, MoveError> 
+    {
+        let (source_chunk, source_row) = source_position;
+        let mut rollback_sequence: Vec<(ComponentID, Box<dyn Any>)> = Vec::new();       
+
+        for component_id in removed_components {
+            if !self.signature.has(component_id) {
+                continue;
+            }
+
+            let source_component = match self.components[component_id as usize].as_mut() {
+                Some(c) => c,
+                None => {
+                    self.rollback_self(rollback_sequence);    
+                    return Err(MoveError::InconsistentStorage);
+                }
+            };
+
+            let (moved_from, rollback) = 
+                match source_component.swap_remove_dyn(source_chunk, source_row) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        self.rollback_self(rollback_sequence);     
+                        return Err(MoveError::SwapRemoveError { component_id, source_error: e });
+                    }
+                };
+
+            if let Some(moved_from) = moved_from {
+                match source_swap_position {
+                    Some(existing) if existing != moved_from => {
+                        self.rollback_self(rollback_sequence);    
+                        return Err(MoveError::InconsistentSwapInfo)
+                    },
+                    _ => {}
+                }
+            }
+
+            rollback_sequence.push((component_id, rollback));
+        }
+
+        Ok(rollback_sequence)
+    }
+
+    #[cfg(not(feature = "rollback"))]  
+    pub fn remove_row_in_components_at_source(
+        &mut self,
+        source_position: (ChunkID, RowID),
+        removed_components: &[ComponentID],
+        source_swap_position: Option<(ChunkID, RowID)>,
+    ) -> Result<(), MoveError> 
+    {
+        let (source_chunk, source_row) = source_position;     
+
+        for component_id in removed_components {
+            if !self.signature.has(component_id) {
+                continue;
+            }
+
+            let source_component = match self.components[component_id as usize].as_mut() {
+                Some(c) => c,
+                None => {
+                    return Err(MoveError::InconsistentStorage);
+                }
+            };
+
+            let (moved_from, rollback) = 
+                match source_component.swap_remove_dyn(source_chunk, source_row) {
+                    Ok(result) => result,
+                    Err(e) => {   
+                        return Err(MoveError::SwapRemoveError { component_id, source_error: e });
+                    }
+                };
+
+            if let Some(moved_from) = moved_from {
+                match source_swap_position {
+                    Some(existing) if existing != moved_from => {  
+                        return Err(MoveError::InconsistentSwapInfo)
+                    },
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn update_entity_on_row_move(
+        &mut self,
+        destination: &mut Archetype,
+        source_position: (ChunkID, RowID),
+        destination_position: (ChunkID, RowID),
+        source_swap_position: Option<(ChunkID, RowID)>,
+        shards: &EntityShards,
+        entity: Entity,
+    ) -> Result<(), MoveError> 
+    {
+        let (destination_chunk, destination_row) = destination_position;
+        let (source_chunk, source_row) = source_position;
+
+        destination.ensure_capacity(destination_chunk as usize + 1);
+        destination.entity_positions[destination_chunk as usize][destination_row as usize] = Some(entity);
+
+        shards.set_location(
+            entity,
+            EntityLocation {
+                archetype: destination.archetype_id,
+                chunk: destination_chunk,
+                row: destination_row,
+            },
+        );
+
+        match source_swap_position {
+            Some((last_chunk, last_row)) => {
+                self.ensure_capacity(last_chunk as usize + 1);
+
+                let swapped_entity = self.entity_positions[last_chunk as usize][last_row as usize]
+                    .ok_or(MoveError::MetadataFailure)?;
+
+                self.entity_positions[source_chunk as usize][source_row as usize] =
+                    Some(swapped_entity);
+
+                shards.set_location(
+                    swapped_entity,
+                    EntityLocation {
+                        archetype: self.archetype_id,
+                        chunk: source_chunk,
+                        row: source_row,
+                    },
+                );
+
+                self.entity_positions[last_chunk as usize][last_row as usize] = None;
+            }
+            None => {
+                self.entity_positions[source_chunk as usize][source_row as usize] = None;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "rollback")]
+    fn rollback_into(
+        &mut self,
+        destination: &mut Archetype,
+        rollback_sequence: Vec<(ComponentID, Box<dyn Any>)>,
+    ) -> Result<(), MoveError> {
+        for (rolled_back_id, rollback_action) in rollback_sequence.into_iter().rev() {
+            let rollback_destination_component = destination.components[rolled_back_id as usize]
+                .as_mut()
+                .ok_or(MoveError::InconsistentStorage)?;
+
+            let rollback_source_component = self.components[rolled_back_id as usize]
+                .as_mut()
+                .ok_or(MoveError::InconsistentStorage)?;
+
+            rollback_destination_component
+                .rollback_dyn(rollback_action, Some(rollback_source_component))
+                .map_err(|_| MoveError::RollbackFailed)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "rollback")]
+    fn rollback_self(
+        &mut self,
+        rollback_sequence: Vec<(ComponentID, Box<dyn Any>)>,
+    ) -> Result<(), MoveError> {
+        for (rolled_back_id, rollback_action) in rollback_sequence.into_iter().rev() {
+            let component = self.components[rolled_back_id as usize]
+                .as_mut()
+                .ok_or(MoveError::InconsistentStorage)?;
+
+            component
+                .rollback_dyn(rollback_action, None)
+                .map_err(|_| MoveError::RollbackFailed)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "rollback"))]
+    fn rollback_into(
+        &mut self,
+        _destination: &mut Archetype,
+        _rollback_sequence: Vec<(ComponentID, Box<dyn Any>)>,
+    ) -> Result<(), MoveError> {
+        Ok(())
+    }
+
+    #[cfg(not(feature = "rollback"))]
+    fn rollback_self(
+        &mut self,
+        _rollback_sequence: Vec<(ComponentID, Box<dyn Any>)>,
+    ) -> Result<(), MoveError> {
+        Ok(())
+    }
+
+    /// Moves an entityï¿½s component row from this archetype to another.
+    ///
+    /// # Purpose
+    /// This operation is used when an entity transitions to a new archetype
+    /// because its set of components has changed (added or removed).
+    ///
+    /// The function constructs a new row in the destination archetype containing
+    /// exactly the components described by the destinationï¿½s signature.
+    ///
+    /// # Behavior
+    ///
+    /// For each component type:
+    ///
+    /// - **If the component exists in both source and destination**  
+    ///   The component value at `(source_chunk, source_row)` is moved into the
+    ///   destination component column via `push_from`, preserving its internal
+    ///   ordering guarantees (including swapï¿½remove semantics).
+    ///
+    /// - **If the component exists in the destination but not in the source**  
+    ///   A value for this component **must** be supplied in `added_components`.
+    ///   That value is inserted using `push_dyn`.
+    ///
+    /// - **If the component exists in the source but not in the destination**  
+    ///   The component value at `(source_chunk, source_row)` is discarded using
+    ///   `swap_remove`, removing the row compactly from the source column.
+    ///
+    /// The first column to receive the moved or inserted value defines the
+    /// destination `(chunk, row)` for this entity. All other component columns
+    /// for the entity must place their data **at exactly the same location**.
+    /// This preserves strict row alignment across all component arrays.
+    ///
+    /// After all component values are written:
+    ///
+    /// - The destination archetypeï¿½s `entity_positions` entry for the final
+    ///   `(chunk, row)` is updated to record the entityï¿½s ID.
+    ///
+    /// - The source archetypeï¿½s row at `(source_chunk, source_row)` is cleared.
+    ///
+    /// - If any source component column performed a swapï¿½remove, the function
+    ///   updates `entity_positions` and the global shard registry so the moved
+    ///   entity now references the correct new position.
+    ///
+    /// - Archetype `length` counters are updated in both source and destination.
+
+    #[cfg(feature = "rollback")]    
     pub fn move_row_to_archetype(
         &mut self,
         destination: &mut Archetype,
         shards: &EntityShards,
         entity: Entity,
-        source_chunk: ChunkID,
-        source_row: RowID,
-        added_component: Option<(ComponentID, Box<dyn std::any::Any>)>,
-    ) -> (ChunkID, RowID) {
-        // For the first moved component, record where the row landed.
-        let mut first_move_destination: Option<(ChunkID, RowID)> = None;
-        // For swap_remove behavior: record if any component swapped from the last element.
-        let mut first_swap_information: Option<(ChunkID, RowID)> = None;
+        source_position: (ChunkID, RowID),
+        mut added_components: Vec<(ComponentID, Box<dyn Any>)>,
+    ) -> Result<(ChunkID, RowID), MoveError> {
+        let mut shared_words = [0u64; SIGNATURE_SIZE];
+        let mut source_only_words = [0u64; SIGNATURE_SIZE];
+        let mut destination_only_words = [0u64; SIGNATURE_SIZE];
 
-        for component_id in self.signature.iterate_over_components() {
-            if !destination.signature.has(component_id) {
-                continue; // skip components not in destination archetype
-            }
+        for i in 0..SIGNATURE_SIZE {
+            let a = self.signature.components[i];
+            let b = destination.signature.components[i];
 
-            // both archetypes must contain this component column.
-            let (destination_component, source_component) = {
-                let source_component = self.components[component_id as usize]
-                    .as_mut()
-                    .expect("source archetype must have this component");
-                let destination_component = destination.components[component_id as usize]
-                    .as_mut()
-                    .expect("destination archetype must have this component");
-                (destination_component, source_component)
-            };
-
-            let ((destination_chunk, destination_row), moved_from_last) =
-                destination_component.push_from(source_component, source_chunk, source_row)
-                    .expect("push_from failed to move component");;
-            
-            // Record the storage location where this new row lives.
-            if first_move_destination.is_none() {
-                first_move_destination = Some((destination_chunk, destination_row));
-            }
-            // Record swap_remove metadata; all components must agree.
-            if first_swap_information.is_none() {
-                first_swap_information = moved_from_last;
-            }
+            shared_words[i] = a & b;
+            source_only_words[i] = a & !b;
+            destination_only_words[i] = b & !a;
         }
 
-        // Handle new component added during move (component insertion operation).
-        if let Some((added_component_id, value)) = added_component {
-            let destination_component = destination.components[added_component_id as usize]
-                .as_mut()
-                .expect("destination must have the newly added component");
+        let shared_components: Vec<ComponentID> =
+            iter_bits_from_words(&shared_words).collect();
 
-            let (added_chunk, added_row) = destination_component.push_dyn(value);
+        let source_only_components: Vec<ComponentID> =
+            iter_bits_from_words(&source_only_words).collect();
 
-            // All columns must share identical row placement for the entity.
-            if let Some((destination_chunk, destination_row)) = first_move_destination {
-                debug_assert_eq!(
-                    (added_chunk, added_row),
-                    (destination_chunk, destination_row),
-                    "added component storage row must match existing moved row"
-                );
+        let destination_only_components: Vec<ComponentID> =
+            iter_bits_from_words(&destination_only_words).collect();
+
+        let mut destination_only_values: Vec<(ComponentID, Box<dyn Any>)> =
+            Vec::with_capacity(destination_only_components.len());
+
+        for &need_id in &destination_only_components {
+            if let Some(pos) = added_components.iter().position(|(id, _)| *id == need_id) {
+                let (_id, val) = added_components.swap_remove(pos);
+                destination_only_values.push((need_id, val));
             } else {
-                // If no other component existed, this defines the row.
-                first_move_destination = Some((added_chunk, added_row));
+                return Err(MoveError::InconsistentStorage);
             }
         }
 
-        // Safe: At least one component must have been created or moved.
-        let (destination_chunk, destination_row) = first_move_destination.expect("must have moved/pushed at least one component");
+        let (destination_position, source_swap_position, mut moved_rollbacks) =
+            self.move_row_across_shared_components(destination, source_position, shared_components)?;
 
-        // Ensure entity_positions can store this row.
-        destination.ensure_capacity((destination_chunk as usize) + 1);
-        
-        // Set entity at destination.
-        destination.entity_positions[destination_chunk as usize][destination_row as usize] = Some(entity);
-        shards.set_location(entity, EntityLocation { archetype: destination.archetype_id, chunk: destination_chunk, row: destination_row });
+        let add_rollbacks = match self.add_row_in_components_at_destination(
+            destination,
+            destination_position,
+            destination_only_values,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.rollback_into(destination, moved_rollbacks);
+                return Err(e);
+            }
+        };
+        moved_rollbacks.extend(add_rollbacks);
 
-        // If swap_remove moved something into the vacated slot, update entity_positions accordingly.
-        if let Some((source_last_chunk, source_last_row)) = first_swap_information {
+        let remove_rollbacks = match self.remove_row_in_components_at_source(
+            source_position,
+            &source_only_components,
+            source_swap_position
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                self.rollback_into(destination, moved_rollbacks);
+                return Err(e);
+            }
+        };
 
-            self.ensure_capacity((source_last_chunk as usize) + 1);
-
-            let moved_entity = self.entity_positions[source_last_chunk as usize][source_last_row as usize]
-                .expect("entity must exist in swapped slot");
-            
-            // Fill hole created by swap_remove.
-            self.entity_positions[source_chunk as usize][source_row as usize] = Some(moved_entity);
-            shards.set_location(moved_entity, EntityLocation { archetype: self.archetype_id, chunk: source_chunk, row: source_row });
-            // Clear swapped source slot.
-            self.entity_positions[source_last_chunk as usize][source_last_row as usize] = None;
-        } else {
-            // No swapping occurred; simply clear the source slot.
-            self.entity_positions[source_chunk as usize][source_row as usize] = None;
+        if let Err(e) = self.update_entity_on_row_move(
+            destination,
+            source_position,
+            destination_position,
+            source_swap_position,
+            shards,
+            entity
+        ) {
+            let _ = self.rollback_self(remove_rollbacks);
+            let _ = self.rollback_into(destination, moved_rollbacks);
+            return Err(e);
         }
 
-        // If a component was removed during relocation, clean up the removed component row.
-        if added_component.is_none() {
-            if let Some(removed_id) = self.signature.iterate_over_components()
-                                       .find(|&component_id| !destination.signature.has(component_id)) {
-                if let Some(source_component) = self.components[removed_id as usize].as_mut() {
-                    let _ = source_component.swap_remove(source_chunk, source_row);
-                }
+        destination.length += 1;
+        self.length = self.length.saturating_sub(1);
+        if self.length == 0 {
+            self.entity_positions.clear();
+        }
+
+        Ok(destination_position)
+    }      
+
+    #[cfg(not(feature = "rollback"))]   
+    pub fn move_row_to_archetype(
+        &mut self,
+        destination: &mut Archetype,
+        shards: &EntityShards,
+        entity: Entity,
+        source_position: (ChunkID, RowID),
+        mut added_components: Vec<(ComponentID, Box<dyn Any>)>,
+    ) -> Result<(ChunkID, RowID), MoveError> {
+        let mut shared_words = [0u64; SIGNATURE_SIZE];
+        let mut source_only_words = [0u64; SIGNATURE_SIZE];
+        let mut destination_only_words = [0u64; SIGNATURE_SIZE];
+
+        for i in 0..SIGNATURE_SIZE {
+            let a = self.signature.components[i];
+            let b = destination.signature.components[i];
+
+            shared_words[i] = a & b;
+            source_only_words[i] = a & !b;
+            destination_only_words[i] = b & !a;
+        }
+
+        let shared_components: Vec<ComponentID> =
+            iter_bits_from_words(&shared_words).collect();
+
+        let source_only_components: Vec<ComponentID> =
+            iter_bits_from_words(&source_only_words).collect();
+
+        let destination_only_components: Vec<ComponentID> =
+            iter_bits_from_words(&destination_only_words).collect();
+
+        let mut destination_only_values: Vec<(ComponentID, Box<dyn Any>)> =
+            Vec::with_capacity(destination_only_components.len());
+
+        for &need_id in &destination_only_components {
+            if let Some(pos) = added_components.iter().position(|(id, _)| *id == need_id) {
+                let (_id, val) = added_components.swap_remove(pos);
+                destination_only_values.push((need_id, val));
+            } else {
+                return Err(MoveError::InconsistentStorage);
             }
         }
 
-        self.length -= 1; // entity removed from source
-        destination.length += 1; // entity added to destination
+        let (destination_position, source_swap_position) =
+            self.move_row_across_shared_components(destination, source_position, shared_components)?;
 
-        (destination_chunk, destination_row)
-    }
+        self.add_row_in_components_at_destination(
+            destination,
+            destination_position,
+            destination_only_values,
+        )?;
+
+        self.remove_row_in_components_at_source(
+            source_position,
+            &source_only_components,
+            source_swap_position
+        )?;
+
+        self.update_entity_on_row_move(
+            destination,
+            source_position,
+            destination_position,
+            source_swap_position,
+            shards,
+            entity
+        )?;
+
+        destination.length += 1;
+        self.length = self.length.saturating_sub(1);
+        if self.length == 0 {
+            self.entity_positions.clear();
+        }
+
+        Ok(destination_position)
+    }  
 
     /// Spawns a new entity into this archetype using the provided component bundle.
     ///
@@ -443,7 +1013,7 @@ impl Archetype {
     /// Writes a full row of component values and allocates an entity handle.
     ///
     /// ## Behavior
-    /// - Each component in the archetype’s signature must be supplied by the bundle.
+    /// - Each component in the archetypeï¿½s signature must be supplied by the bundle.
     /// - All component attributes must write to the same `(chunk, row)` location.
     /// - On failure, all partial writes are rolled back.
     ///
@@ -456,7 +1026,12 @@ impl Archetype {
     /// ## Invariants
     /// Attribute alignment and entity position mappings must remain consistent.
 
-    pub fn spawn_on(&mut self, shards: &mut EntityShards, shard_id: ShardID, mut bundle: impl DynamicBundle) -> Result<Entity, SpawnError> {
+    pub fn spawn_on(
+        &mut self, 
+        shards: &mut EntityShards, 
+        shard_id: ShardID, 
+        mut bundle: impl DynamicBundle
+    ) -> Result<Entity, SpawnError> {
         // Keep track of columns already written so that roll back is possible on error.
         let mut written_index: Vec<usize> = Vec::new();
         let mut reference_position: Option<(ChunkID, RowID)> = None;
@@ -476,7 +1051,7 @@ impl Archetype {
                 if let Some((c, r)) = reference_position {
                     for &j in &written_index {
                         if let Some(s) = self.components[j].as_mut() {
-                            let _ = s.swap_remove(c, r);
+                            let _ = s.swap_remove_dyn(c, r);
                         }
                     }
                 }
@@ -490,7 +1065,7 @@ impl Archetype {
                     if let Some((c, r)) = reference_position {
                         for &j in &written_index {
                             if let Some(s) = self.components[j].as_mut() {
-                                let _ = s.swap_remove(c, r);
+                                let _ = s.swap_remove_dyn(c, r);
                             }
                         }
                     }
@@ -585,8 +1160,8 @@ impl Archetype {
 
         for component in self.components.iter_mut().filter_map(|c| c.as_mut()) {
             // swap_remove keeps columns compact; all components must agree on moved row.
-            let position = component.swap_remove(entity_chunk, entity_row)
-                .expect("swap_remove failed in despawn");
+            let position = component.swap_remove_dyn(entity_chunk, entity_row)
+                .map_err(|e| SpawnError::StorageSwapRemoveFailed(e))?;
             if let Some(expected) = moved_from {
                 debug_assert_eq!(position, Some(expected), "all components must move the same row");
             } else {
@@ -614,6 +1189,9 @@ impl Archetype {
         }
         
         self.length -= 1;
+        if self.length == 0 {
+            self.entity_positions.clear();
+        }
         Ok(())
     }
 
@@ -641,21 +1219,33 @@ impl Archetype {
         let length = self.chunk_valid_length(chunk);
         let mut reads = Vec::with_capacity(read_ids.len());
         let mut writes = Vec::with_capacity(write_ids.len());
+ 
+        // Safety: The returned raw pointers are derived from mutable slices
+        // obtained from component storage. The caller must ensure:
+        // 1. No component appears in both read_ids and write_ids
+        // 2. The chunk index is valid
+        // 3. The returned pointers don't outlive the archetype
+        
+        // Validate no overlap between reads and writes
+        for &read_id in read_ids {
+            if write_ids.contains(&read_id) {
+                panic!("Component {} appears in both read and write lists", read_id);
+            }
+        }
 
         for &component_id in read_ids {
             let component = self.components[component_id as usize].as_ref().expect("missing read component");
-            let s = component.chunk_slice_ref::<u8>(chunk, length).expect("slice type mismatch");
-            reads.push(s);
+            let slice = component.chunk_slice::<u8>(chunk, length).expect("missing read component data");
+            reads.push(slice);
         }
 
         for &component_id in write_ids {
             let component = self.components[component_id as usize].as_ref().expect("missing write component");
-            let s = component.as_ref();
-            let pointer = s as *const _ as *mut u8;
-            writes.push(pointer);
+            let bytes = component.chunk_slice_mut::<u8>(chunk, length).expect("missing write component data");
+            writes.push(bytes.as_mut_ptr());
         }
-        
-        ChunkBorrow { length, reads, writes }
+
+        ChunkBorrow { length, reads, writes, _marker: std::marker::PhantomData }
     }
 
     /// Constructs a new archetype and inserts empty attributes for the provided
@@ -670,35 +1260,16 @@ impl Archetype {
     /// The resulting archetype is empty but has a fully defined signature.
 
     pub fn from_components<T: IntoIterator<Item = std::any::TypeId>>(archetype_id: ArchetypeID, types: T) -> Self {
-        let mut me = Self::new(archetype_id);
+        let mut archetype = Self::new(archetype_id);
 
         // Create empty component columns for a predefined signature.
         for type_id in types {
             let component_id = component_id_of_type_id(type_id)
                 .expect("component type must be registered before creating archetypes.");
             let component: Box<dyn TypeErasedAttribute> = make_empty_component_for(component_id);
-            me.insert_empty_component(component_id, component);
+            archetype.insert_empty_component(component_id, component);
         }
-        me
-    }
-}
-
-impl Archetype {
-
-    /// Returns a reference to the archetype's signature.
-    ///
-    /// ## Notes
-    /// Used by query and filtering logic.
-
-    pub fn signature(&self) -> &Signature { &self.signature }
-
-    /// Returns `true` if this archetype contains all components described in `need`.
-    ///
-    /// ## Notes
-    /// This performs a subset check using signature bits.
-
-    pub fn matches_all(&self, need: &Signature) -> bool {
-        self.signature.contains_all(need)
+        archetype
     }
 }
 
