@@ -1,9 +1,9 @@
 use std::{
     ptr,
-    any::{Any, TypeId},
-    any::{type_name},
+    any::{Any, TypeId, type_name},
     mem::MaybeUninit,
-    convert::TryInto
+    convert::TryInto,
+    array
 };
 
 use crate::types::{ChunkID, RowID, CHUNK_CAP};
@@ -31,6 +31,7 @@ use crate::error::{PositionOutOfBoundsError, TypeMismatchError, AttributeError};
 /// All variants assume that the attribute’s underlying invariants were maintained
 /// at the time the action was created.
 
+#[cfg(feature = "rollback")]
 enum RollbackAction<T> {
 
     /// Reverts a `swap_remove` operation.
@@ -127,9 +128,26 @@ enum RollbackAction<T> {
     },
 }
 
+/// # Rollback Support
+///
+/// Rollback functionality is conditionally compiled:
+/// - **With `rollback` feature**: Methods return `RollbackAction` for undo operations
+/// - **Without `rollback` feature**: Methods return simplified results, no undo capability
+///
+/// When the `rollback` feature is disabled, the following simplifications occur:
+/// - `push()` returns only the insertion position
+/// - `swap_remove()` returns only the moved-from position (if any)
+/// - `push_from()` returns only destination and moved-from positions
+/// - `rollback()` method is not available
+
+#[cfg(not(feature = "rollback"))]
+enum RollbackAction<T> {
+    Noop,
+}
+
 #[inline]
 fn new_uninit_chunk<T>() -> Box<[MaybeUninit<T>; CHUNK_CAP]> {
-    Box::new(std::array::from_fn(|_| MaybeUninit::uninit()))
+    Box::new(array::from_fn(|_| MaybeUninit::uninit()))
 }
 
 /// A type-erased interface for chunked attribute storage.
@@ -148,7 +166,7 @@ fn new_uninit_chunk<T>() -> Box<[MaybeUninit<T>; CHUNK_CAP]> {
 ///   `0 < last_chunk_length <= CHUNK_CAP`, unless `length() == 0`.
 /// - All indices below `length()` correspond to initialized, valid elements.
 /// - Types exposed through `chunk_slice_ref`, `chunk_slice_mut`, and `push_dyn` must
-///   correspond to the attribute’s concrete element type.
+///   correspond to the attribute's concrete element type.
 ///
 /// This interface allows:
 /// - querying storage structure,
@@ -160,7 +178,7 @@ fn new_uninit_chunk<T>() -> Box<[MaybeUninit<T>; CHUNK_CAP]> {
 /// Although the trait uses no explicit `unsafe` methods, implementing it requires
 /// ensuring memory correctness around uninitialized regions and type alignment.
 /// Callers must only request typed slices (`chunk_slice_ref`, `chunk_slice_mut`) that
-/// match the implementing attribute’s element type. Mismatches must return `None`.
+/// match the implementing attribute's element type. Mismatches must return `None`.
 ///
 /// # Downcasting
 /// Implementers must return `self` cast to `&dyn Any` / `&mut dyn Any` so callers can
@@ -179,22 +197,24 @@ fn new_uninit_chunk<T>() -> Box<[MaybeUninit<T>; CHUNK_CAP]> {
 /// mutation interface compatible with the typed equivalents on concrete attribute
 /// implementations.
 ///
-/// - `swap_remove` removes an element at `(chunk, row)` using constant-time
-///   swap-remove semantics.
-/// - `push_dyn` inserts a dynamically-typed element, verifying that its runtime
-///   type matches the attribute’s element type.
-/// - `push_from` moves one element from a source attribute into `self`, performing
-///   swap-remove on the source when necessary.
+/// #[cfg(feature = "rollback")]
+/// **With rollback feature enabled:**
+/// - `swap_remove_dyn` removes an element and returns a rollback action.
+/// - `push_dyn` inserts a dynamically-typed element and returns a rollback action.
+/// - `push_from_dyn` moves an element between attributes and returns a rollback action.
+/// - `rollback_dyn` applies a previously generated rollback action.
 ///
-/// Implementers must preserve attribute invariants and return appropriate
-/// `AttributeError` values when type mismatches or invalid positions occur.
+/// #[cfg(not(feature = "rollback"))]
+/// **With rollback feature disabled:**
+/// - `swap_remove_dyn` removes an element without rollback capability.
+/// - `push_dyn` inserts a dynamically-typed element without rollback capability.
+/// - `push_from_dyn` moves an element between attributes without rollback capability.
+/// - `rollback_dyn` is a no-op that always succeeds.
 ///
 /// # Intended usage
 /// This trait is suitable when:
 /// - components or attributes must be managed in a type-erased container,
 /// - serializers/deserializers need read/write access to raw storage,
-/// - ECS schedulers must move or copy attributes between entities without knowing
-///   their concrete types,
 /// - low-level systems operate on contiguous chunks of memory for performance.
 ///
 /// Implementing this trait correctly enables efficient, safe, and flexible
@@ -214,17 +234,33 @@ pub trait TypeErasedAttribute: Any + Send + Sync {
     fn element_type_id(&self) -> TypeId;
     fn element_type_name(&self) -> &'static str;
 
+    #[cfg(feature = "rollback")]
     fn swap_remove_dyn(
         &mut self, 
         chunk: ChunkID, 
         row: RowID
     ) -> Result<(Option<(ChunkID, RowID)>, Box<dyn Any>), AttributeError>;
     
+    #[cfg(not(feature = "rollback"))]
+    fn swap_remove_dyn(
+        &mut self, 
+        chunk: ChunkID, 
+        row: RowID
+    ) -> Result<Option<(ChunkID, RowID)>, AttributeError>;
+    
+    #[cfg(feature = "rollback")]
     fn push_dyn(
         &mut self, 
         value: Box<dyn Any>
     ) -> Result<((ChunkID, RowID), Box<dyn Any>), AttributeError>;
     
+    #[cfg(not(feature = "rollback"))]
+    fn push_dyn(
+        &mut self, 
+        value: Box<dyn Any>
+    ) -> Result<(ChunkID, RowID), AttributeError>;
+    
+    #[cfg(feature = "rollback")]
     fn push_from_dyn(
         &mut self, 
         source: &mut dyn TypeErasedAttribute, 
@@ -232,7 +268,20 @@ pub trait TypeErasedAttribute: Any + Send + Sync {
         source_row: RowID
     ) -> Result<((ChunkID, RowID), Option<(ChunkID, RowID)>, Box<dyn Any>), AttributeError>;
 
-    fn rollback_dyn(&mut self, action: Box<dyn Any>, source: Option<&mut dyn TypeErasedAttribute>) -> Result<(), AttributeError>;
+    #[cfg(not(feature = "rollback"))]
+    fn push_from_dyn(
+        &mut self, 
+        source: &mut dyn TypeErasedAttribute, 
+        source_chunk: ChunkID, 
+        source_row: RowID
+    ) -> Result<((ChunkID, RowID), Option<(ChunkID, RowID)>), AttributeError>;
+
+    #[cfg(feature = "rollback")]
+    fn rollback_dyn(
+        &mut self, 
+        action: Box<dyn Any>, 
+        source: Option<&mut dyn TypeErasedAttribute>
+    ) -> Result<(), AttributeError>;
 }
 
 /// A chunked, contiguous, column-oriented storage container for elements of type `T`.
@@ -336,6 +385,9 @@ pub struct Attribute<T> {
 }
 
 impl<T> Attribute<T> {
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
 
     /// Ensures that there is a writable chunk at the end of the attribute.
     ///
@@ -351,7 +403,7 @@ impl<T> Attribute<T> {
     #[inline]
     fn ensure_last_chunk(&mut self) {
         if self.chunks.is_empty() || self.last_chunk_length == CHUNK_CAP {
-            self.chunks.push(Box::new(std::array::from_fn(|_| MaybeUninit::<T>::uninit())));
+            self.chunks.push(Box::new(array::from_fn(|_| MaybeUninit::<T>::uninit())));
             self.last_chunk_length = 0;
         }
     }
@@ -492,11 +544,17 @@ impl<T> Attribute<T> {
         })
     }
 
-    /// Appends a new element to the attribute and returns:
-    /// - its assigned `(ChunkID, RowID)` location, and
-    /// - a [`RollbackAction::Push`] describing how to undo the insertion.
+    /// Appends a new element to the attribute.
     ///
     /// Automatically creates a new chunk if the last chunk is full.
+    ///
+    /// # Returns
+    /// #[cfg(feature = "rollback")]
+    /// Returns both the assigned `(ChunkID, RowID)` location and a
+    /// [`RollbackAction::Push`] describing how to undo the insertion.
+    ///
+    /// #[cfg(not(feature = "rollback"))]
+    /// Returns only the assigned `(ChunkID, RowID)` location.
     ///
     /// # Errors
     /// Returns [`AttributeError::IndexOverflow`] if either the chunk index or row
@@ -506,6 +564,7 @@ impl<T> Attribute<T> {
     /// Writes into a `MaybeUninit<T>` slot using raw pointer write. The slot is
     /// guaranteed valid due to `ensure_last_chunk()`.
 
+    #[cfg(feature = "rollback")]
     pub fn push(
         &mut self, 
         value: T
@@ -516,7 +575,7 @@ impl<T> Attribute<T> {
 
         self.ensure_last_chunk();
         let chunk_index = self.chunks.len() - 1;
-        let row_index   = self.last_chunk_length;
+        let row_index = self.last_chunk_length;
 
         let chunk_id: ChunkID = chunk_index.try_into()
             .map_err(|_| AttributeError::IndexOverflow("ChunkID"))?;
@@ -544,9 +603,34 @@ impl<T> Attribute<T> {
         )
     }
 
+    #[cfg(not(feature = "rollback"))]
+    pub fn push(
+        &mut self, 
+        value: T
+    ) -> Result<(ChunkID, RowID), AttributeError> {
+        self.ensure_last_chunk();
+        let chunk_index = self.chunks.len() - 1;
+        let row_index = self.last_chunk_length;
+
+        let chunk_id: ChunkID = chunk_index.try_into()
+            .map_err(|_| AttributeError::IndexOverflow("ChunkID"))?;
+        let row_id: RowID = row_index.try_into()
+            .map_err(|_| AttributeError::IndexOverflow("RowID"))?;
+
+        unsafe {
+            self.get_slot_unchecked(chunk_index, row_index)
+                .as_mut_ptr()
+                .write(value);
+        }
+
+        self.last_chunk_length += 1;
+        self.length += 1;
+
+        Ok((chunk_id, row_id))
+    }
+
     /// Removes an element at the given `(chunk, row)` using a constant-time
-    /// swap-remove strategy, returning both the structural effects of the removal
-    /// and a rollback action capable of fully restoring the previous state.
+    /// swap-remove strategy.
     ///
     /// This operation removes the element at the specified position. If the removed
     /// element is not the final element in the attribute, the last element is moved
@@ -559,40 +643,29 @@ impl<T> Attribute<T> {
     /// - `row`:   The row within the chunk.
     ///
     /// # Returns
-    /// On success, returns:
+    /// #[cfg(feature = "rollback")]
+    /// Returns both the structural effects of the removal and a rollback action
+    /// capable of fully restoring the previous state.
     ///
-    /// ```ignore
-    /// Ok((moved_from, rollback_action))
-    /// ```
-    ///
-    /// - `moved_from` — `Some((c, r))` if the element originally located at
-    ///   `(c, r)` was moved into `(chunk, row)` as part of the swap;  
-    ///   otherwise `None` if the removed element was already the last element.
-    /// - `rollback_action` — A [`RollbackAction::SwapRemove`] variant containing
-    ///   everything necessary to **restore** the data structure to its exact
-    ///   previous state.
+    /// #[cfg(not(feature = "rollback"))]
+    /// Returns only information about the structural effects of the removal.
     ///
     /// # Errors
     /// Returns a [`PositionOutOfBounds`] error if `(chunk, row)` does not identify
     /// a valid, initialized element.
     ///
     /// # Safety
-    /// Internally uses `unsafe` memory operations (`assume_init_read`,
-    /// `write`). The attribute guarantees that:
+    /// Internally uses `unsafe` memory operations (`ptr::read`, `ptr::write`).
+    /// The attribute guarantees that:
     /// - all slots up to `length` are initialized,  
     /// - moved-from positions are valid,  
     /// - chunk boundaries match `last_chunk_length`.
     ///
     /// # Complexity
     /// Constant time: `O(1)`.
-    ///
-    /// # Rollback
-    /// The returned rollback action can restore:
-    /// - the removed value at its original position,  
-    /// - the moved last value (if any),  
-    /// - all length and chunk-boundary metadata.
 
-    fn swap_remove(
+    #[cfg(feature = "rollback")]
+    pub fn swap_remove(
         &mut self, 
         chunk: ChunkID, 
         row: RowID
@@ -602,7 +675,7 @@ impl<T> Attribute<T> {
         if chunk as usize >= self.chunks.len() {
             return Err(
                 AttributeError::Position(
-                        Position {
+                        PositionOutOfBoundsError {
                         chunk, 
                         row, 
                         chunks: chunk_count,
@@ -617,7 +690,7 @@ impl<T> Attribute<T> {
         if index >= self.length {
             return Err(
                 AttributeError::Position(
-                    PositionOutOfBounds {
+                    PositionOutOfBoundsError {
                         chunk,
                         row,
                         chunks: chunk_count,
@@ -646,39 +719,40 @@ impl<T> Attribute<T> {
             )
         };
 
-        unsafe {
-            self
-            .get_slot_unchecked(chunk as usize, row as usize)
-            .as_mut_ptr()
-            .write(MaybeUninit::uninit());
-        }
-
-
-        let mut moved_from: Option<(ChunkID, RowID)> = None;
-        let mut moved_value: Option<T> = None;
-
+        let mut moved: Option<((ChunkID, RowID), T)> = None;
 
         if !is_last {
             let last_value = unsafe {
-                self
-                .get_slot_unchecked(last_chunk, last_row)
-                .assume_init_read()
+                ptr::read(
+                    self
+                    .get_slot_unchecked(last_chunk, last_row)
+                    .as_ptr() as *const T
+                )
             };
 
-            moved_from = Some((
-                last_chunk.try_into().unwrap(),
-                last_row.try_into().unwrap()
-            ));
-            
-            moved_value = Some(last_value);
-            
             unsafe {
                 ptr::write(
-                    self
-                    .get_slot_unchecked(chunk as usize, row as usize)
-                    .as_mut_ptr(),
-                    moved_value.unwrap()
+                    self.get_slot_unchecked(chunk as usize, row as usize)
+                        .as_mut_ptr(),
+                    last_value
                 );
+            }
+
+            moved = Some((
+                (last_chunk as ChunkID, last_row as RowID),
+                last_value
+            ));
+        
+            unsafe {
+                self.get_slot_unchecked(last_chunk, last_row)
+                    .as_mut_ptr()
+                    .write(MaybeUninit::uninit());
+            }
+        } else {
+            unsafe {
+                self.get_slot_unchecked(chunk as usize, row as usize)
+                    .as_mut_ptr()
+                    .write(MaybeUninit::uninit());
             }
         }
 
@@ -698,6 +772,11 @@ impl<T> Attribute<T> {
             self.last_chunk_length = new_last_row + 1;
         }
 
+        let (moved_from, moved_value) = match moved {
+            Some(((c, r), v)) => (Some((c, r)), Some(v)),
+            None => (None, None),
+        };
+
         Ok(
             (
                 moved_from,
@@ -714,10 +793,114 @@ impl<T> Attribute<T> {
         )
     }   
 
-    /// Moves a value out of a source attribute and inserts it into `self`,
-    /// returning both the destination insertion position, information about any
-    /// swap-remove that occurred in the source, and a rollback action capable of
-    /// undoing the entire cross-attribute move.
+    #[cfg(not(feature = "rollback"))]
+    pub fn swap_remove(
+        &mut self, 
+        chunk: ChunkID, 
+        row: RowID
+    ) -> Result<Option<(ChunkID, RowID)>, AttributeError> {
+        let chunk_count = self.chunks.len();
+        
+        if chunk as usize >= self.chunks.len() {
+            return Err(
+                AttributeError::Position(
+                        PositionOutOfBoundsError {
+                        chunk, 
+                        row, 
+                        chunks: chunk_count,
+                        capacity: CHUNK_CAP,
+                        last_chunk_length: self.last_chunk_length,
+                    }
+                )
+            );
+        }
+
+        let index = chunk as usize * CHUNK_CAP + row as usize;    
+        if index >= self.length {
+            return Err(
+                AttributeError::Position(
+                    PositionOutOfBoundsError {
+                        chunk,
+                        row,
+                        chunks: chunk_count,
+                        capacity: CHUNK_CAP,
+                        last_chunk_length: self.last_chunk_length,
+                    }
+                )
+            );
+        }
+
+        let last_index = self.length - 1;
+        let last_chunk = last_index / CHUNK_CAP;
+        let last_row = last_index % CHUNK_CAP;
+        
+        let is_last = (chunk as usize == last_chunk) && (row as usize == last_row);
+        
+        unsafe {
+            ptr::read(
+                self
+                .get_slot_unchecked(chunk as usize, row as usize)
+                .as_ptr() as *const T
+            );
+        }
+
+        let mut moved_from: Option<(ChunkID, RowID)> = None;
+
+        if !is_last {
+            let last_value = unsafe {
+                ptr::read(
+                    self
+                    .get_slot_unchecked(last_chunk, last_row)
+                    .as_ptr() as *const T
+                )
+            };
+
+            unsafe {
+                ptr::write(
+                    self.get_slot_unchecked(chunk as usize, row as usize)
+                        .as_mut_ptr(),
+                    last_value
+                );
+            }
+
+            moved_from = Some((
+                last_chunk as ChunkID,
+                last_row as RowID
+            ));
+        
+            unsafe {
+                self.get_slot_unchecked(last_chunk, last_row)
+                    .as_mut_ptr()
+                    .write(MaybeUninit::uninit());
+            }
+        } else {
+            unsafe {
+                self.get_slot_unchecked(chunk as usize, row as usize)
+                    .as_mut_ptr()
+                    .write(MaybeUninit::uninit());
+            }
+        }
+
+        self.length -= 1;
+
+        if self.length == 0 {
+            self.last_chunk_length = 0;
+            self.chunks.clear();
+        } else {
+            let new_last_chunk = (self.length - 1) / CHUNK_CAP;
+            let new_last_row = (self.length - 1) % CHUNK_CAP;
+
+            while self.chunks.len() - 1 > new_last_chunk {
+                self.chunks.pop();
+            }
+
+            self.last_chunk_length = new_last_row + 1;
+        }
+
+        Ok(moved_from)
+    }
+
+    /// Moves a value out of a source attribute and inserts it into `self`.
     ///
     /// This operation:
     ///
@@ -726,29 +909,21 @@ impl<T> Attribute<T> {
     /// 3. Pushes it into the destination (`self`), producing an insertion position.
     /// 4. Performs a swap-remove in the source attribute, which may move the source's
     ///    last element to fill the removed slot.
-    /// 5. Updates chunk metadata and returns a rollback action containing everything
-    ///    needed to restore *both* attributes.
     ///
     /// # Parameters
-    /// - `source`: A dynamically-typed attribute expected to hold `T`.
+    /// - `source`: A mutable reference to the source attribute.
     /// - `source_chunk`: Chunk index of the element to transfer.
     /// - `source_row`: Row index of the element to transfer.
     ///
     /// # Returns
+    /// #[cfg(feature = "rollback")]
+    /// Returns the destination insertion position, information about any swap-remove
+    /// that occurred in the source, and a rollback action capable of undoing the
+    /// entire cross-attribute move.
     ///
-    /// ```ignore
-    /// Ok(((dest_chunk, dest_row), moved_from_source, rollback_action))
-    /// ```
-    ///
-    /// - `(dest_chunk, dest_row)` — where the value was inserted into `self`.
-    /// - `moved_from_source` — `Some((c, r))` if the source attribute had to move
-    ///   its last element into `(source_chunk, source_row)`; otherwise `None`.
-    /// - `rollback_action` — a [`RollbackAction::PushFrom`] variant which can
-    ///   restore:
-    ///     - the destination insertion (by removing it),
-    ///     - the original value at the original source location,
-    ///     - the displaced "last element" in the source (if any),
-    ///     - source metadata (length/chunks).
+    /// #[cfg(not(feature = "rollback"))]
+    /// Returns only the destination insertion position and information about any
+    /// swap-remove that occurred in the source.
     ///
     /// # Errors
     /// - [`PositionOutOfBounds`] if `(source_chunk, source_row)` is invalid.
@@ -764,29 +939,16 @@ impl<T> Attribute<T> {
     /// # Complexity
     /// `O(1)` for both the transfer and the source swap-remove.
 
-    fn push_from(
+    #[cfg(feature = "rollback")]
+    pub fn push_from(
         &mut self, 
-        source: &mut dyn TypeErasedAttribute, 
+        source: &mut Attribute<T>, 
         source_chunk: ChunkID, 
         source_row: RowID
     ) -> Result<((ChunkID, RowID), Option<(ChunkID, RowID)>, RollbackAction<T>), AttributeError> {
-        
-        let source_attribute = match source.as_any_mut().downcast_mut::<Attribute<T>>() {
-            Some(sa) => sa,
-            None => {
-                return Err(
-                    AttributeError::TypeMismatch(
-                        TypeMismatchError {
-                            expected: TypeId::of::<T>(),
-                            actual: source.element_type_id()
-                        }
-                    )
-                );
-            }
-        };
 
-        let source_chunk_count = source_attribute.chunks.len();
-        if !source_attribute.valid_position(source_chunk, source_row) {
+        let source_chunk_count = source.chunks.len();
+        if !source.valid_position(source_chunk, source_row) {
             return Err(
                 AttributeError::Position(
                     PositionOutOfBoundsError {
@@ -794,7 +956,7 @@ impl<T> Attribute<T> {
                         row: source_row,
                         chunks: source_chunk_count,
                         capacity: CHUNK_CAP,
-                        last_chunk_length: source_attribute.last_chunk_length,
+                        last_chunk_length: source.last_chunk_length,
                     }
                 )
             );
@@ -804,17 +966,17 @@ impl<T> Attribute<T> {
         let destination_previous_last_chunk_length = self.last_chunk_length;
         let dest_previous_chunk_count = self.chunks.len();
 
-        let source_previous_length = source_attribute.length;
-        let source_previous_last_chunk_length = source_attribute.last_chunk_length;
-        let source_previous_chunk_count = source_attribute.chunks.len();
+        let source_previous_length = source.length;
+        let source_previous_last_chunk_length = source.last_chunk_length;
+        let source_previous_chunk_count = source.chunks.len();
 
         let moved_value = unsafe {
             let value = ptr::read(
-                source_attribute
+                source
                     .get_slot_unchecked(source_chunk as usize, source_row as usize)
                     .as_ptr() as *const T
             );
-            source_attribute
+            source
                 .get_slot_unchecked(source_chunk as usize, source_row as usize)
                 .as_mut_ptr()
                 .write(MaybeUninit::uninit());
@@ -825,7 +987,7 @@ impl<T> Attribute<T> {
             Ok((pos, _)) => pos,
             Err(e) => {
                 unsafe {
-                    source_attribute
+                    source
                         .get_slot_unchecked(source_chunk as usize, source_row as usize)
                         .as_mut_ptr()
                         .write(moved_value);
@@ -834,7 +996,7 @@ impl<T> Attribute<T> {
             }
         };
 
-        let last_index = source_attribute.length - 1;
+        let last_index = source.length - 1;
         let last_chunk = last_index / CHUNK_CAP;
         let last_row = last_index % CHUNK_CAP;
 
@@ -846,11 +1008,11 @@ impl<T> Attribute<T> {
         if source_index != last_index {       
             let last_value = unsafe {
                 let value = ptr::read(
-                    source_attribute
+                    source
                         .get_slot_unchecked(last_chunk, last_row)
                         .as_ptr() as *const T
                 );
-                source_attribute
+                source
                     .get_slot_unchecked(last_chunk, last_row)
                     .as_mut_ptr()
                     .write(MaybeUninit::uninit());
@@ -870,31 +1032,33 @@ impl<T> Attribute<T> {
                 last_value,
             ));
 
-            unsafe {
-                ptr::write(
-                    source_attribute
-                    .get_slot_unchecked(source_chunk as usize, source_row as usize)
-                    .as_mut_ptr(),
-                    displaced_information.unwrap().1
-                );
+            if let Some(((_, _), last_value)) = displaced_information {
+                unsafe {
+                    ptr::write(
+                        source
+                        .get_slot_unchecked(source_chunk as usize, source_row as usize)
+                        .as_mut_ptr(),
+                        last_value
+                    );
+                }
             }
 
         }
 
-        source_attribute.length -= 1;
+        source.length -= 1;
         
-        if source_attribute.length == 0 {
-            source_attribute.chunks.clear();
-            source_attribute.last_chunk_length = 0;
+        if source.length == 0 {
+            source.chunks.clear();
+            source.last_chunk_length = 0;
         } else {
-            let new_last_chunk = (source_attribute.length - 1) / CHUNK_CAP;
-            let new_last_row = (source_attribute.length - 1) % CHUNK_CAP;
+            let new_last_chunk = (source.length - 1) / CHUNK_CAP;
+            let new_last_row = (source.length - 1) % CHUNK_CAP;
 
-            while source_attribute.chunks.len() - 1 > new_last_chunk {
-                source_attribute.chunks.pop();
+            while source.chunks.len() - 1 > new_last_chunk {
+                source.chunks.pop();
             }
 
-            source_attribute.last_chunk_length = new_last_row + 1;
+            source.last_chunk_length = new_last_row + 1;
         }
 
         Ok(
@@ -917,6 +1081,111 @@ impl<T> Attribute<T> {
         )  
     }
 
+    #[cfg(not(feature = "rollback"))]
+    pub fn push_from(
+        &mut self, 
+        source: &mut Attribute<T>, 
+        source_chunk: ChunkID, 
+        source_row: RowID
+    ) -> Result<((ChunkID, RowID), Option<(ChunkID, RowID)>), AttributeError> {
+        let source_chunk_count = source.chunks.len();
+        if !source.valid_position(source_chunk, source_row) {
+            return Err(
+                AttributeError::Position(
+                    PositionOutOfBoundsError {
+                        chunk: source_chunk,
+                        row: source_row,
+                        chunks: source_chunk_count,
+                        capacity: CHUNK_CAP,
+                        last_chunk_length: source.last_chunk_length,
+                    }
+                )
+            );
+        }
+
+        let moved_value = unsafe {
+            let value = ptr::read(
+                source
+                    .get_slot_unchecked(source_chunk as usize, source_row as usize)
+                    .as_ptr() as *const T
+            );
+            source
+                .get_slot_unchecked(source_chunk as usize, source_row as usize)
+                .as_mut_ptr()
+                .write(MaybeUninit::uninit());
+            value
+        };
+        
+        let (destination_chunk, destination_row) = match self.push(moved_value) {
+            Ok(pos) => pos,
+            Err(e) => {
+                unsafe {
+                    source
+                        .get_slot_unchecked(source_chunk as usize, source_row as usize)
+                        .as_mut_ptr()
+                        .write(moved_value);
+                }
+                return Err(e);
+            }
+        };
+
+        let last_index = source.length - 1;
+        let last_chunk = last_index / CHUNK_CAP;
+        let last_row = last_index % CHUNK_CAP;
+
+        let mut moved_from_source: Option<(ChunkID, RowID)> = None;
+
+        let source_index = source_chunk as usize * CHUNK_CAP + source_row as usize;
+        
+        if source_index != last_index {       
+            let last_value = unsafe {
+                let value = ptr::read(
+                    source
+                        .get_slot_unchecked(last_chunk, last_row)
+                        .as_ptr() as *const T
+                );
+                source
+                    .get_slot_unchecked(last_chunk, last_row)
+                    .as_mut_ptr()
+                    .write(MaybeUninit::uninit());
+                value
+            };
+            
+            moved_from_source = Some((
+                last_chunk.try_into().unwrap(),
+                last_row.try_into().unwrap(),
+            ));
+
+            unsafe {
+                ptr::write(
+                    source
+                    .get_slot_unchecked(source_chunk as usize, source_row as usize)
+                    .as_mut_ptr(),
+                    last_value
+                );
+            }
+        }
+
+        source.length -= 1;
+        
+        if source.length == 0 {
+            source.chunks.clear();
+            source.last_chunk_length = 0;
+        } else {
+            let new_last_chunk = (source.length - 1) / CHUNK_CAP;
+            let new_last_row = (source.length - 1) % CHUNK_CAP;
+
+            while source.chunks.len() - 1 > new_last_chunk {
+                source.chunks.pop();
+            }
+
+            source.last_chunk_length = new_last_row + 1;
+        }
+
+        Ok(((destination_chunk, destination_row), moved_from_source))
+    }
+
+    #[cfg(feature = "rollback")]
     /// Reverts a previously executed mutation represented by a [`RollbackAction`].  
     ///
     /// This function is the inverse of all mutating operations that produce
@@ -961,9 +1230,10 @@ impl<T> Attribute<T> {
     ///
     /// # Notes
     /// Rollback is idempotent **only if never applied twice**.  
-    /// Rollback actions represent *state deltas*, not reversible transactions.  
+    /// Rollback actions represent *state deltas*, not reversible transactions.
 
-    fn rollback(&mut self, action: RollbackAction<T>, source: Option<&mut Attribute<T>>) {
+    #[cfg(feature = "rollback")]
+    pub fn rollback(&mut self, action: RollbackAction<T>, source: Option<&mut Attribute<T>>) {
         match action {
             RollbackAction::SwapRemove {
                 previous_length,
@@ -985,11 +1255,11 @@ impl<T> Attribute<T> {
                         .write(removed_value);
                 }
 
-                if let Some((mc, mr)) = moved_from {
+                if let (Some((mc, mr)), Some(value)) = (moved_from, moved_value) {
                     unsafe {
                         self.get_slot_unchecked(mc as usize, mr as usize)
                             .as_mut_ptr()
-                            .write(moved_value.unwrap());
+                            .write(value);
                     }
                 }
             }
@@ -1121,16 +1391,15 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
     fn element_type_name(&self) -> &'static str {type_name::<T>()} // Returns the human-readable name of the element type stored in this attribute.
 
     /// Returns a typed immutable slice of the elements stored in the specified
-    /// chunk, if and only if the requested type `U` matches the attribute’s actual
+    /// chunk, if and only if the requested type `U` matches the attribute's actual
     /// element type `T`.
     ///
-    /// This function provides efficient, zero-copy access to a portion of a chunk’s
+    /// This function provides efficient, zero-copy access to a portion of a chunk's
     /// memory. It is intended for bulk iteration, serialization, and other
-    /// performance-critical operations where working directly with a contiguous slice
-    /// of values is beneficial.
+    /// performance-critical operations.
     ///
     /// # Parameters
-    /// - `chunk`: The chunk index from which to retrieve elements.
+    /// - `chunk_id`: The chunk index from which to retrieve elements.
     /// - `valid_length`: The maximum number of elements the caller intends to
     ///   operate on. The returned slice will have length:
     ///
@@ -1144,7 +1413,7 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
     /// # Returns
     /// - `Some(&[U])` if:
     ///   - `U` is the concrete element type stored in this attribute (`U == T`), and  
-    ///   - `chunk` is a valid chunk index.
+    ///   - `chunk_id` is a valid chunk index.
     /// - `None` if the type does not match or the chunk index is out of bounds.
     ///
     /// # Type Matching
@@ -1153,19 +1422,12 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
     /// Type mismatches return `None` instead of attempting any conversion.
     ///
     /// # Safety
-    /// Internally, this function performs:
-    ///
-    /// - bounds-checked chunk lookup,  
-    /// - a raw-pointer slice creation using `from_raw_parts`,  
-    /// - a transmute from `[T]` to `[U]` after verifying `TypeId::of::<T>() == TypeId::of::<U>()`.
-    ///
-    /// These operations are safe *only because*:
+    /// Internally, this function performs bounds-checked chunk lookup and creates
+    /// a slice from initialized memory. These operations are safe because:
     /// - The attribute guarantees that the first `len` elements of the chunk are
     ///   fully initialized,
     /// - The type check ensures layout compatibility,
     /// - The slice never outlives the attribute.
-    ///
-    /// Callers receive a safe reference with all aliasing rules preserved.
     ///
     /// # Usage Example
     /// ```ignore
@@ -1190,61 +1452,58 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
         }
         .min(valid_length);
 
-        let pointer = chunk.as_ptr() as *const MaybeUninit<T>;
-        let pointer = pointer as *const T;
+        let slice_pointer = chunk.as_ptr() as *const MaybeUninit<T>;
+        let data_pointer = slice_pointer as *const T;
 
         Some(unsafe {
-            std::slice::from_raw_parts(pointer as *const U, length)
+            std::slice::from_raw_parts(data_pointer as *const U, length)
         })
     }
 
     /// Returns a typed mutable slice of the elements stored in the specified
-    /// chunk, if and only if the requested type `U` matches the attribute’s actual
+    /// chunk, if and only if the requested type `U` matches the attribute's actual
     /// element type `T`.
     ///
-    /// This method provides fast, zero-copy mutable access to chunk data. It is
-    /// typically used for bulk updates, physics/AI computations, and other systems
-    /// that operate over contiguous attribute memory.
+    /// This function provides efficient, zero-copy access to a portion of a chunk's
+    /// memory. It is intended for bulk iteration, serialization, and other
+    /// performance-critical operations.
     ///
     /// # Parameters
-    /// - `chunk`: The chunk index to retrieve.
-    /// - `valid_length`: The maximum number of elements the caller expects to
-    ///   modify. The returned slice length is:
+    /// - `chunk_id`: The chunk index from which to retrieve elements.
+    /// - `valid_length`: The maximum number of elements the caller intends to
+    ///   operate on. The returned slice will have length:
     ///
     ///   ```ignore
     ///   min(valid_length, actual_initialized_length_of_chunk)
     ///   ```
     ///
+    ///   This allows callers to request a subset of a chunk without needing to know
+    ///   its exact populated length.
+    ///
     /// # Returns
-    /// - `Some(&mut [U])` if:
-    ///   - the requested type `U` matches the internal element type `T`, and  
-    ///   - `chunk` identifies a valid chunk.
-    /// - `None` otherwise.
+    /// - `Some(&[U])` if:
+    ///   - `U` is the concrete element type stored in this attribute (`U == T`), and  
+    ///   - `chunk_id` is a valid chunk index.
+    /// - `None` if the type does not match or the chunk index is out of bounds.
     ///
-    /// # Alias and Mutability Guarantees
-    /// The returned slice is the only live mutable reference to those elements.
-    /// The attribute implementation must guarantee that:
-    ///
-    /// - no other references exist to the same memory,
-    /// - the chunk's contents are initialized for the returned length,
-    /// - the caller cannot access uninitialized or out-of-bounds memory.
+    /// # Type Matching
+    /// Since this method is exposed through a type-erased interface, it can only
+    /// return a slice if the caller requests exactly the type stored internally.
+    /// Type mismatches return `None` instead of attempting any conversion.
     ///
     /// # Safety
-    /// Internally uses:
-    ///
-    /// - `from_raw_parts_mut` to create a mutable slice,  
-    /// - a transmute between `[T]` and `[U]` after verifying type equality.
-    ///
-    /// This is safe due to:
-    /// - strict type checking (`U == T`),
-    /// - invariant that the first `len` elements in the chunk are initialized,
-    /// - exclusive access ensured by `&mut self`.
+    /// Internally, this function performs bounds-checked chunk lookup and creates
+    /// a slice from initialized memory. These operations are safe because:
+    /// - The attribute guarantees that the first `len` elements of the chunk are
+    ///   fully initialized,
+    /// - The type check ensures layout compatibility,
+    /// - The slice never outlives the attribute.
     ///
     /// # Usage Example
     /// ```ignore
-    /// if let Some(values) = attr.chunk_slice_mut::<Transform>(chunk_id, CHUNK_CAP) {
-    ///     for t in values {
-    ///         t.position += Vec3::new(1.0, 0.0, 0.0);
+    /// if let Some(values) = attr.chunk_slice_mut::<f32>(chunk_id, 128) {
+    ///     for v in values {
+    ///         println!("value = {}", v);
     ///     }
     /// }
     /// ```
@@ -1263,36 +1522,25 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
         }
         .min(valid_length);
 
-        let pointer = chunk.as_mut_ptr() as *mut MaybeUninit<T>;
-        let pointer = pointer as *mut T;
+        let slice_pointer = chunk.as_mut_ptr() as *mut MaybeUninit<T>;
+        let data_pointer = slice_pointer as *mut T;
 
         Some(unsafe {
-            std::slice::from_raw_parts_mut(pointer as *mut U, length)
+            std::slice::from_raw_parts_mut(data_pointer as *mut U, length)
         })
     }    
 
-    /// Attempts to push a dynamically-typed value into the attribute.  
+    /// Attempts to push a dynamically-typed value into the attribute.
     ///
     /// If the provided `Box<dyn Any>` contains a value of type `T`, it is extracted
-    /// and forwarded to [`Attribute::push`], which returns both the new element
-    /// position and a rollback action.
-    ///
-    /// If the dynamic value is not of type `T`, a [`TypeMismatch`] error is
-    /// returned.
-    ///
-    /// # Parameters
-    /// - `value`: A boxed dynamic object expected to contain a `T`.
+    /// and forwarded to [`Attribute::push`].
     ///
     /// # Returns
-    /// On success:
+    /// #[cfg(feature = "rollback")]
+    /// Returns both the insertion location and a rollback action.
     ///
-    /// ```ignore
-    /// Ok(((chunk, row), rollback_action))
-    /// ```
-    ///
-    /// - `(chunk, row)` is the insertion location.
-    /// - `rollback_action` is a [`RollbackAction::Push`] variant, which can remove
-    ///   the inserted value and restore the structure.
+    /// #[cfg(not(feature = "rollback"))]
+    /// Returns only the insertion location.
     ///
     /// # Errors
     /// - [`AttributeError::TypeMismatch`] if the dynamic value has the wrong type.
@@ -1300,7 +1548,8 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
     /// # Notes
     /// This method is used when type-erasure is required (e.g., in ECS systems or
     /// heterogeneous attribute stores).
-
+    
+    #[cfg(feature = "rollback")]
     fn push_dyn(
         &mut self, 
         value: Box<dyn Any>
@@ -1314,6 +1563,42 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
         Err(AttributeError::TypeMismatch(TypeMismatchError { expected, actual }))
     }
 
+    #[cfg(not(feature = "rollback"))]
+    fn push_dyn(
+        &mut self, 
+        value: Box<dyn Any>
+    ) -> Result<(ChunkID, RowID), AttributeError> {
+        if let Ok(v) = value.downcast::<T>() {
+            let position = self.push(*v)?;
+            return Ok(position);
+        }
+        let expected = TypeId::of::<T>();
+        let actual = value.as_ref().type_id();
+        Err(AttributeError::TypeMismatch(TypeMismatchError { expected, actual }))
+    }
+
+    /// Attempts to remove an element at the given position using swap-remove.
+    ///
+    /// If the provided `(chunk, row)` is valid, this method removes the element
+    /// and returns information about the structural changes.
+    ///
+    /// # Returns
+    /// #[cfg(feature = "rollback")]
+    /// Returns both the moved-from position (if any) and a rollback action that
+    /// can restore the removed element and any structural changes.
+    ///
+    /// #[cfg(not(feature = "rollback"))]
+    /// Returns only the moved-from position (if any) without rollback capability.
+    ///
+    /// # Errors
+    /// - [`AttributeError::Position`] if the `(chunk, row)` position is invalid.
+    /// - Any error that may arise from the underlying `swap_remove` operation.
+    ///
+    /// # Notes
+    /// This method provides type-erased access to the swap-remove operation,
+    /// allowing dynamic attribute manipulation without knowing the concrete type.    
+    
+    #[cfg(feature = "rollback")]
     fn swap_remove_dyn(
         &mut self,
         chunk: ChunkID,
@@ -1323,6 +1608,43 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
         Ok((moved, Box::new(rollback)))
     }
 
+    #[cfg(not(feature = "rollback"))]
+    fn swap_remove_dyn(
+        &mut self,
+        chunk: ChunkID,
+        row: RowID,
+    ) -> Result<Option<(ChunkID, RowID)>, AttributeError> {
+        self.swap_remove(chunk, row)
+    }    
+
+    /// Moves an element from a source attribute into this attribute.
+    ///
+    /// This method transfers an element from the specified position in the source
+    /// attribute to this attribute, performing necessary swap-remove operations
+    /// in the source if the removed element wasn't the last.
+    ///
+    /// # Returns
+    /// #[cfg(feature = "rollback")]
+    /// Returns the destination insertion position, information about any
+    /// swap-remove that occurred in the source, and a rollback action that can
+    /// undo the entire cross-attribute transfer.
+    ///
+    /// #[cfg(not(feature = "rollback"))]
+    /// Returns only the destination insertion position and information about any
+    /// swap-remove that occurred in the source, without rollback capability.
+    ///
+    /// # Errors
+    /// - [`AttributeError::TypeMismatch`] if the source attribute doesn't store
+    ///   the same element type as this attribute.
+    /// - [`AttributeError::Position`] if the `(source_chunk, source_row)` position
+    ///   is invalid in the source attribute.
+    /// - Any error that may arise from the underlying `push_from` operation.
+    ///
+    /// # Notes
+    /// This method enables type-erased movement of elements between attributes,
+    /// which is useful for entity component migration or bulk transfers in ECS.
+
+    #[cfg(feature = "rollback")]
     fn push_from_dyn(
         &mut self,
         source: &mut dyn TypeErasedAttribute,
@@ -1345,6 +1667,55 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
         Ok((position, moved, Box::new(rollback)))
     }    
 
+    #[cfg(not(feature = "rollback"))]
+    fn push_from_dyn(
+        &mut self,
+        source: &mut dyn TypeErasedAttribute,
+        source_chunk: ChunkID,
+        source_row: RowID,
+    ) -> Result<((ChunkID, RowID), Option<(ChunkID, RowID)>), AttributeError> {
+        let source_attribute = source
+            .as_any_mut()
+            .downcast_mut::<Attribute<T>>()
+            .ok_or_else(|| {
+                AttributeError::TypeMismatch(
+                    TypeMismatchError {
+                        expected: TypeId::of::<T>(),
+                        actual: source.element_type_id()
+                    }
+                )
+            })?;
+
+        self.push_from(source_attribute, source_chunk, source_row)
+    }
+
+    #[cfg(feature = "rollback")]
+    /// Applies a previously generated rollback action to restore attribute state.
+    ///
+    /// This method is the type-erased counterpart to [`Attribute::rollback`],
+    /// allowing rollback actions to be applied through the dynamic trait interface.
+    ///
+    /// # Parameters
+    /// - `action`: A boxed rollback action that was previously generated by
+    ///   `push_dyn`, `swap_remove_dyn`, or `push_from_dyn`.
+    /// - `source`: Required only for `PushFrom` rollback actions, where the
+    ///   original value came from a different attribute. For other actions,
+    ///   this should be `None`.
+    ///
+    /// # Returns
+    /// Returns `Ok(())` if the rollback was successfully applied, or an error
+    /// if the action type doesn't match this attribute's element type.
+    ///
+    /// # Errors
+    /// - [`AttributeError::TypeMismatch`] if the provided action doesn't contain
+    ///   a `RollbackAction<T>` matching this attribute's element type `T`.
+    ///
+    /// # Notes
+    /// Rollback actions are one-shot and should only be applied once to the
+    /// exact attribute that generated them. Applying a rollback multiple times
+    /// or to a different attribute will lead to incorrect state.
+
+    #[cfg(feature = "rollback")]    
     fn rollback_dyn(
         &mut self, 
         action: Box<dyn Any>, 
@@ -1365,6 +1736,28 @@ impl<T: 'static + Send + Sync> TypeErasedAttribute for Attribute<T> {
             )
         }
     }
+
+    #[cfg(not(feature = "rollback"))]
+    /// No-op method when rollback feature is disabled.
+    ///
+    /// This method exists for trait compatibility but performs no operation
+    /// and always returns success when the rollback feature is disabled.
+    ///
+    /// # Returns
+    /// Always returns `Ok(())`.
+    ///
+    /// # Notes
+    /// When the `rollback` feature is disabled, rollback actions are not generated
+    /// or stored, so this method is a no-op that maintains API compatibility.
+
+    #[cfg(not(feature = "rollback"))]
+    fn rollback_dyn(
+        &mut self, 
+        _action: Box<dyn Any>, 
+        _source: Option<&mut dyn TypeErasedAttribute>
+    ) -> Result<(), AttributeError> {
+        Ok(())
+    }       
 }   
 
 impl<T> Default for Attribute<T> {
