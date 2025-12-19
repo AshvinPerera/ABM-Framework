@@ -78,6 +78,9 @@ The included examples demonstrate these steps end-to-end.
 - Non-overlapping write guarantees
 - Phase-based scheduling
 
+## In Development
+- component validation using a component registry
+
 ## Future Development
 - GPU integration
 - scripting language for quick simulation design
