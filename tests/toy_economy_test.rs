@@ -4,7 +4,7 @@ use abm_framework::engine::component::{register_component, freeze_components, co
 use abm_framework::engine::entity::EntityShards;
 use abm_framework::engine::manager::{ECSManager, ECSReference};
 use abm_framework::engine::systems::{System};
-use abm_framework::engine::scheduler::{make_stages, run_schedule};
+use abm_framework::engine::scheduler::Scheduler;
 use abm_framework::engine::types::{Bundle, AccessSets};
 use abm_framework::engine::commands::Command;
 
@@ -202,7 +202,7 @@ fn toy_economy_ecs_abm() {
     freeze_components();
 
     let shards = EntityShards::new(4);
-    let mut ecs = ECSManager::new(shards);
+    let ecs = ECSManager::new(shards);
 
     {
         let world = ecs.world_ref();
@@ -233,18 +233,16 @@ fn toy_economy_ecs_abm() {
     }
     ecs.apply_deferred_commands();
 
-    let systems: Vec<Box<dyn System>> = vec![
-        Box::new(ProductionSystem),
-        Box::new(WagePaymentSystem),
-        Box::new(PriceSystem),
-        Box::new(SpendingSystem),
-        Box::new(HungerSystem),
-    ];
+    let mut scheduler = Scheduler::new();
 
-    let stages = make_stages(systems);
+    scheduler.add_system(ProductionSystem);
+    scheduler.add_system(WagePaymentSystem);
+    scheduler.add_system(PriceSystem);
+    scheduler.add_system(SpendingSystem);
+    scheduler.add_system(HungerSystem);
 
     for step in 0..1000 {
-        run_schedule(&mut ecs, &stages);
+        scheduler.run(&ecs);
 
         let world = ecs.world_ref();
         let data = world.data_mut();
@@ -270,7 +268,7 @@ fn toy_economy_ecs_abm() {
             let n = count.load(Ordering::Relaxed) as f32;
             let avg_price = total / n;
 
-        println!("{},{}", step, avg_price);
+            println!("{},{}", step, avg_price);
         }
     }
 }

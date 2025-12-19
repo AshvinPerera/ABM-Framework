@@ -69,6 +69,15 @@ use crate::engine::types::{SystemID, AccessSets};
 use crate::engine::manager::ECSReference;
 
 
+/// Execution backend for a system.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemBackend {
+    /// Standard Rust / Rayon execution on CPU.
+    CPU,
+    /// Placeholder for future GPU dispatch.
+    GPU
+}
+
 /// A unit of executable logic operating on the ECS world.
 ///
 /// A `System` represents a scheduled computation that:
@@ -85,6 +94,13 @@ pub trait System: Send + Sync {
 
     /// Returns the component access sets required by this system.
     fn access(&self) -> AccessSets;
+
+    /// Returns which backend this system should run on.
+    /// Defaults to [`SystemBackend::Cpu`].
+    #[inline]
+    fn backend(&self) -> SystemBackend {
+        SystemBackend::CPU
+    }    
 
     /// Executes the system logic against the ECS world.
     fn run(&self, world: ECSReference<'_>);
