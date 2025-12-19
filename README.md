@@ -79,7 +79,7 @@ The included examples demonstrate these steps end-to-end.
 - Phase-based scheduling
 
 ## In Development
-- component validation using a component registry
+- Component validation using a component registry
 
 ## Future Development
 - GPU integration
