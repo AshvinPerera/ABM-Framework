@@ -4,13 +4,15 @@ It is designed for large-scale agent-based economic models with millions of agen
 deterministic scheduling to ensure reproducible simulation runs. The library is written in Rust, leveraging safe, explicit data access to ensure memory safety.
 
 The library targtes economists, social scientists, and researchers who need a scalable simulation toolkit for agent-based modeling (especially economic systems). 
-The crate builds as both an rlib and a C-compatible cdylib for FFI use, making it flexible for integration into varied workflows.
+The crate builds as both an rlib and a cdylib. A stable C-compatible FFI API is planned but not yet exposed.
 
-Note that this is currently a hobby project of mine to both 1. learn the internals of a scalable agent based modeling framework, and 2. to develop my own 
+Note: 
+- This is currently a hobby project of mine to both 1. learn the internals of a scalable agent based modeling framework, and 2. to develop my own 
 economic agent based models.
+- Determinism is guaranteed at the scheduling and data-access level; numerical determinism depends on system logic and RNG usage.
 
 ## Installation
-Add the crate to your project by including it in your Cargo.toml
+Syren targets Rust 2021 and later. Add the crate to your project by including it in your Cargo.toml
 
 ``` rust
 [dependencies]
@@ -25,7 +27,8 @@ running systems in a schedule. The repository includes one example simulation at
 
 `toy_economy_test.rs` – a full example using abm_framework’s ECS to implement a simple toy economy with households and firms.
 
-You can run these examples via `cargo test`. The following steps outline the ECS workflow, referencing the `toy_economy_test.rs` example
+The example simulation is implemented as an integration test and can be run via `cargo test`. 
+The following steps outline the ECS workflow, referencing the `toy_economy_test.rs` example
 
 - Register Components: Define your component types and register each one before building the world.
 ``` rust
@@ -38,7 +41,9 @@ freeze_components();
 
 - Initialize the ECS: Create the ECS manager with a chosen number of shards (worker threads).
 ``` rust
-let ecs = ECSManager::new(EntityShards::new(4));
+let shards = EntityShards::new(4);
+let data = ECSData::new(shards);
+let ecs = ECSManager::new(data);
 ```
 
 - Spawn Entities: Build component bundles and defer spawn commands to add entities.
@@ -47,7 +52,8 @@ let mut bundle = Bundle::new();
 bundle.insert(component_id_of::<Cash>(), Cash(100.0));
 bundle.insert(component_id_of::<Inventory>(), Inventory(50.0));
 // ... insert other components ...
-data.defer(Command::Spawn { bundle });
+let world = ecs.world_ref();
+world.defer(Command::Spawn { bundle });
 ```
 
 - Define Systems and Schedule: Implement your logic as structs that implement the `System` trait. Collect them into a stage schedule.
@@ -74,6 +80,7 @@ The included examples demonstrate these steps end-to-end.
 - Cache-friendly chunk iteration
 - Parallel execution using Rayon
 - Read/write access declarations
+- Explicit system read/write declarations enforced at runtime
 - Deferred structural mutations
 - Non-overlapping write guarantees
 - Phase-based scheduling
