@@ -45,10 +45,10 @@ pub use engine::component::{
 pub use engine::query::QueryBuilder;
 
 pub use engine::systems::System;
+pub use engine::systems::{FnSystem, SystemBackend};
 pub use engine::scheduler::{
     Stage,
-    make_stages,
-    run_schedule,
+    Scheduler
 };
 
 pub use engine::commands::Command;
@@ -82,6 +82,8 @@ pub mod prelude {
         Entity,
         QueryBuilder,
         System,
+        FnSystem,
+        SystemBackend,
         Signature,
         register_component,
         freeze_components,

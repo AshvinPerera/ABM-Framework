@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use abm_framework::engine::component::{register_component, freeze_components, component_id_of};
 use abm_framework::engine::entity::EntityShards;
 use abm_framework::engine::manager::ECSManager;
