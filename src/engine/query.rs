@@ -4,9 +4,52 @@
 //! *describing* ECS queries: which components are required, which are read,
 //! which are written, and which must be absent.
 
-use crate::engine::types::{QuerySignature, ComponentID, AccessSets, set_read, set_write, set_without};
-use crate::engine::component::{component_id_of};
+use crate::engine::types::{ComponentID};
+use crate::engine::component::{Signature, component_id_of};
+use crate::engine::systems::AccessSets;
+use crate::engine::error::{ExecutionError, InvalidAccessReason};
 
+
+/// Component signature used for query matching.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QuerySignature {
+    /// Components read by the query.
+    pub read: Signature,
+
+    /// Components written by the query.
+    pub write: Signature,
+
+    /// Components explicitly excluded from the query.
+    pub without: Signature,
+}
+
+impl QuerySignature {
+    /// Returns `true` if an archetype satisfies this query.
+    pub fn requires_all(&self, archetype_signature: &Signature) -> bool {
+        archetype_signature.contains_all(&self.read)
+            && archetype_signature.contains_all(&self.write)
+            && archetype_signature
+                .components
+                .iter()
+                .zip(self.without.components.iter())
+                .all(|(arch_word, without_word)| (arch_word & without_word) == 0)
+    }
+}
+
+/// Marks a component type as read-only in a query signature.
+pub fn set_read<T: 'static + Send + Sync>(signature: &mut QuerySignature) {
+    signature.read.set(component_id_of::<T>());
+}
+
+/// Marks a component type as writable in a query signature.
+pub fn set_write<T: 'static + Send + Sync>(signature: &mut QuerySignature) {
+    signature.write.set(component_id_of::<T>());
+}
+
+/// Excludes a component type from a query signature.
+pub fn set_without<T: 'static + Send + Sync>(signature: &mut QuerySignature) {
+    signature.without.set(component_id_of::<T>());
+}
 
 /// An immutable, fully constructed ECS query description.
 ///
@@ -89,12 +132,62 @@ impl QueryBuilder {
     }
 
     /// Finalizes the query description and returns an immutable [`BuiltQuery`].  
-    pub fn build(self) -> BuiltQuery {
-        BuiltQuery {
+    pub fn build(mut self) -> Result<BuiltQuery, ExecutionError> {
+        self.reads.sort_unstable();
+        self.writes.sort_unstable();
+
+        // Detect duplicates
+        for w in self.reads.windows(2) {
+            if w[0] == w[1] {
+                return Err(ExecutionError::InvalidQueryAccess {
+                    component_id: w[0],
+                    reason: InvalidAccessReason::DuplicateAccess,
+                });
+            }
+        }
+        for w in self.writes.windows(2) {
+            if w[0] == w[1] {
+                return Err(ExecutionError::InvalidQueryAccess {
+                    component_id: w[0],
+                    reason: InvalidAccessReason::DuplicateAccess,
+                });
+            }
+        }
+
+        self.reads.dedup();
+        self.writes.dedup();
+
+        // Disallow overlap: read & write same component
+        for component_id in &self.reads {
+            if self.writes.binary_search(component_id).is_ok() {
+                return Err(ExecutionError::InvalidQueryAccess {
+                    component_id: *component_id,
+                    reason: InvalidAccessReason::ReadAndWrite,
+                });
+            }
+        }
+
+        // Disallow write & without overlap
+        for (word_idx, (&w_word, &without_word)) in self.signature.write.components.iter()
+            .zip(self.signature.without.components.iter())
+            .enumerate()
+        {
+            let overlap = w_word & without_word;
+            if overlap != 0 {
+                let bit = overlap.trailing_zeros() as u32;
+                let component_id = (word_idx as u32) * 64 + bit;
+                return Err(ExecutionError::InvalidQueryAccess {
+                    component_id: component_id as ComponentID,
+                    reason: InvalidAccessReason::WriteAndWithout,
+                });
+            }
+        }
+
+        Ok(BuiltQuery {
             signature: self.signature,
             reads: self.reads,
             writes: self.writes,
-        }
+        })
     }
 
     /// Returns the declared read/write access sets for this query.

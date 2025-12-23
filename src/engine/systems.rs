@@ -12,7 +12,7 @@
 //!
 //! The system abstraction is designed to:
 //!
-//! - **Enable safe parallelism**
+//! - **Enable parallel scheduling**
 //!   by statically declaring component access (`read` / `write`) via [`AccessSets`].
 //!
 //! - **Decouple logic from storage**
@@ -27,7 +27,7 @@
 //! Systems are scheduled by the engine using their declared access sets:
 //!
 //! - Systems with *non-conflicting* access may run in parallel.
-//! - Systems with conflicting writes are serialized.
+//! - Systems with conflicting writes are serialized relative to one another.
 //! - Ordering is stabilized using system IDs.
 //!
 //! The scheduler is free to group systems into execution stages based on this
@@ -53,8 +53,11 @@
 //! ## Thread Safety
 //!
 //! Systems do **not** receive direct mutable access to the world. Instead, they
-//! operate through [`ECSReference`], which enforces the access guarantees declared
-//! by the system. This prevents data races even under parallel execution.
+//! operate through [`ECSReference`], which provides controlled entry points into
+//! ECS execution phases.
+//!
+//! Correctness is enforced at runtime via borrow tracking and execution-phase discipline; 
+//! the scheduler optimizes parallelism.
 //!
 //! ## Intended Usage
 //!
@@ -65,9 +68,41 @@
 //!
 //! Together, these components form the execution layer of the ECS.
 
-use crate::engine::types::{SystemID, AccessSets};
+use crate::engine::types::{SystemID};
+use crate::engine::component::{Signature};
 use crate::engine::manager::ECSReference;
+use crate::engine::error::ExecutionError;
 
+
+/// Declares the component access set of a system.
+#[derive(Clone, Debug, Default)]
+pub struct AccessSets {
+    /// Components read by the system.
+    pub read: Signature,
+    /// Components written by the system.
+    pub write: Signature,
+}
+
+impl AccessSets {
+    /// Returns `true` if this access set conflicts with another.
+    #[inline]
+    pub fn conflicts_with(&self, other: &AccessSets) -> bool {
+        // Conflicts if: (W ∩ W) or (W ∩ R) or (R ∩ W)
+        let mut w_and_w = false;
+        let mut w_and_r = false;
+        let mut r_and_w = false;
+
+        for ((a_w, a_r), (b_w, b_r)) in self.write.components.iter().zip(self.read.components.iter())
+            .zip(other.write.components.iter().zip(other.read.components.iter()))
+        {
+            if (a_w & b_w) != 0 { w_and_w = true; }
+            if (a_w & b_r) != 0 { w_and_r = true; }
+            if (a_r & b_w) != 0 { r_and_w = true; }
+            if w_and_w || w_and_r || r_and_w { return true; }
+        }
+        false
+    }
+}
 
 /// Execution backend for a system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,7 +138,7 @@ pub trait System: Send + Sync {
     }    
 
     /// Executes the system logic against the ECS world.
-    fn run(&self, world: ECSReference<'_>);
+    fn run(&self, world: ECSReference<'_>) -> Result<(), ExecutionError>;
 }
 
 /// A concrete [`System`] backed by a function or closure.
@@ -111,15 +146,14 @@ pub trait System: Send + Sync {
 /// `FnSystem` allows systems to be defined inline using a function or
 /// closure, without requiring a custom system type.
 ///
-/// It stores:
-/// - a system ID,
-/// - a human-readable name,
-/// - declared component access,
-/// - and the executable function itself.
-
+/// The function must return `Result<(), ExecutionError>` so that
+/// execution failures can be propagated through the scheduler.
 pub struct FnSystem<F>
 where
-    F: Fn(ECSReference<'_>) + Send + Sync + 'static,
+    F: Fn(ECSReference<'_>) -> Result<(), ExecutionError>
+        + Send
+        + Sync
+        + 'static,
 {
     id: SystemID,
     name: &'static str,
@@ -129,7 +163,10 @@ where
 
 impl<F> FnSystem<F>
 where
-    F: Fn(ECSReference<'_>) + Send + Sync + 'static,
+    F: Fn(ECSReference<'_>) -> Result<(), ExecutionError>
+        + Send
+        + Sync
+        + 'static,
 {
     /// Creates a new function-backed system.
     ///
@@ -155,7 +192,10 @@ where
 
 impl<F> System for FnSystem<F>
 where
-    F: Fn(ECSReference<'_>) + Send + Sync + 'static,
+    F: Fn(ECSReference<'_>) -> Result<(), ExecutionError>
+        + Send
+        + Sync
+        + 'static,
 {
     fn id(&self) -> SystemID {
         self.id
@@ -165,7 +205,7 @@ where
         self.access.clone()
     }
 
-    fn run(&self, world: ECSReference<'_>) {
+    fn run(&self, world: ECSReference<'_>) -> Result<(), ExecutionError> {
         (self.f)(world)
     }
 }

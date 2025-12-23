@@ -13,23 +13,31 @@
 //! * stages are executed sequentially.
 //!
 //! This allows maximal parallelism while preserving safety guarantees
-//! derived from declared read/write access sets.
+//! derived from declared read/write access sets, in conjunction with
+//! execution-phase discipline enforced by the ECS manager.
 //!
 //! ## Structural synchronization
 //!
-//! Deferred ECS commands (spawns, despawns, component mutations) are applied:
-//! * **before** each stage begins,
-//! * **after** each stage completes.
+//! Deferred ECS commands (spawns, despawns, component mutations) are applied
+//! at explicit synchronization points controlled by the ECS manager,
+//! typically between scheduler stages.
+//! 
+//! ## Safety note
+//!
+//! This module assumes that systems are executed only within the
+//! appropriate ECS execution phases; violating phase discipline
+//! may result in undefined behavior.
 
-
+use std::sync::Mutex;
 use rayon::prelude::*;
 
-use crate::engine::manager::ECSManager;
-use crate::engine::systems::{System, SystemBackend};
-use crate::engine::types::AccessSets;
+use crate::engine::manager::ECSReference;
+use crate::engine::systems::{AccessSets, System, SystemBackend};
+use crate::engine::component::Signature;
+use crate::engine::error::ExecutionError;
 
 
-/// An execution stage used by [`Scheduler`].
+/// A logical execution stage used by [`Scheduler`] during planning.
 ///
 /// Stores *indices* into the scheduler's system list. This lets the
 /// scheduler:
@@ -67,8 +75,8 @@ impl Stage {
     }
 }
 
-/// Scheduler that stores systems, compiles them into conflict-free execution stages,
-/// and executes stages with parallelism.
+/// Scheduler that stores systems, compiles them into conflict-free execution stages
+/// based on declared access sets, and executes stages with parallelism.
 pub struct Scheduler {
     systems: Vec<Box<dyn System>>,
     /// Cached CPU stages.
@@ -131,8 +139,12 @@ impl Scheduler {
     pub fn add_fn_system<F>(
         &mut self,
         system: crate::engine::systems::FnSystem<F>,
-    ) where
-        F: Fn(crate::engine::manager::ECSReference<'_>) + Send + Sync + 'static,
+    )
+    where
+        F: Fn(crate::engine::manager::ECSReference<'_>) -> Result<(), ExecutionError>
+            + Send
+            + Sync
+            + 'static,
     {
         self.add_system(system);
     }
@@ -145,10 +157,34 @@ impl Scheduler {
         name: &'static str,
         access: AccessSets,
         f: F,
-    ) where
-        F: Fn(crate::engine::manager::ECSReference<'_>) + Send + Sync + 'static,
+    )
+    where
+        F: Fn(crate::engine::manager::ECSReference<'_>) -> Result<(), ExecutionError>
+            + Send
+            + Sync
+            + 'static,
     {
         self.add_fn_system(crate::engine::systems::FnSystem::new(id, name, access, f));
+    }
+
+    /// Registers an infallible function-backed system.
+    /// The function is automatically wrapped to return `Ok(())`.
+    
+    #[inline]
+    pub fn add_fn_infallible<F>(
+        &mut self,
+        id: crate::engine::types::SystemID,
+        name: &'static str,
+        access: AccessSets,
+        f: F,
+    )
+    where
+        F: Fn(crate::engine::manager::ECSReference<'_>) + Send + Sync + 'static,
+    {
+        self.add_fn(id, name, access, move |world| {
+            f(world);
+            Ok(())
+        });
     }
 
     /// Ensures stages are up to date.
@@ -178,7 +214,6 @@ impl Scheduler {
             // Greedy packing into the first compatible stage.
             let mut placed = false;
             for stage in self.cpu_stages.iter_mut() {
-                // Empty stages are boundaries; don't pack across them.
                 if stage.system_indices.is_empty() {
                     continue;
                 }
@@ -201,43 +236,45 @@ impl Scheduler {
     /// Runs the schedule once.
     ///
     /// This will:
-    /// 1) rebuild the plan if needed,
+    /// 1) rebuild the execution plan if needed,
     /// 2) execute each stage sequentially,
-    /// 3) run systems within a stage in parallel,
-    /// 4) apply deferred commands before and after each stage.
-    pub fn run(&mut self, ecs: &ECSManager) {
+    /// 3) run systems within a stage in parallel.
+    ///
+    /// Structural synchronization is expected to be handled
+    /// by the ECS manager at higher-level execution boundaries
+    
+    pub fn run(&mut self, ecs: ECSReference<'_>) -> Result<(), ExecutionError> {
         self.rebuild();
 
         for stage in &self.cpu_stages {
-            ecs.apply_deferred_commands();
-
-            // Boundary / future GPU stage marker.
             if stage.system_indices.is_empty() {
-                // In a GPU-enabled build, this is where GPU kernels would run.
-                ecs.apply_deferred_commands();
                 continue;
             }
 
+            let err: Mutex<Option<ExecutionError>> = Mutex::new(None);
+
             stage.system_indices.par_iter().for_each(|&system_idx| {
-                let world = ecs.world_ref();
-                self.systems[system_idx].run(world);
+                if err.lock().unwrap().is_some() {
+                    return;
+                }
+                if let Err(e) = self.systems[system_idx].run(ecs) {
+                    *err.lock().unwrap() = Some(e);
+                }
             });
 
-            ecs.apply_deferred_commands();
+            if let Some(e) = err.into_inner().unwrap() {
+                return Err(e);
+            }
         }
-    }
 
-    /// Returns a lightweight view of the CPU stages.
-    pub fn cpu_stages(&mut self) -> &[Stage] {
-        self.rebuild();
-        &self.cpu_stages
+        Ok(())
     }
 }
 
 #[inline]
 fn or_signature_in_place(
-    dst: &mut crate::engine::types::Signature,
-    src: &crate::engine::types::Signature
+    dst: &mut Signature,
+    src: &Signature
 ) {
     for (d, s) in dst.components.iter_mut().zip(src.components.iter()) {
         *d |= *s;

@@ -37,6 +37,7 @@ pub use engine::entity::{
 };
 
 pub use engine::component::{
+    Signature,
     register_component,
     freeze_components,
     component_id_of,
@@ -54,15 +55,18 @@ pub use engine::scheduler::{
 pub use engine::commands::Command;
 
 pub use engine::error::{
+    ECSResult,
+    ECSError,
     SpawnError,
-    AttributeError
+    AttributeError,
+    ExecutionError,
+    MoveError,
 };
 
 pub use engine::types::{
     EntityID,
     ComponentID,
-    ArchetypeID,
-    Signature,
+    ArchetypeID
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

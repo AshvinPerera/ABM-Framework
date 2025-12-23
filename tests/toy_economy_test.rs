@@ -1,12 +1,13 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use abm_framework::engine::component::{register_component, freeze_components, component_id_of};
+use abm_framework::engine::component::{Bundle, register_component, freeze_components, component_id_of};
 use abm_framework::engine::entity::EntityShards;
-use abm_framework::engine::manager::{ECSManager, ECSReference};
-use abm_framework::engine::systems::{System};
+use abm_framework::engine::manager::{ECSManager, ECSReference, ECSData};
+use abm_framework::engine::systems::{AccessSets, System};
 use abm_framework::engine::scheduler::Scheduler;
-use abm_framework::engine::types::{Bundle, AccessSets};
 use abm_framework::engine::commands::Command;
+use abm_framework::engine::error::{ExecutionError, ECSResult};
+
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)] struct AgentTag(pub u8);
@@ -34,23 +35,24 @@ impl System for ProductionSystem {
         a
     }
 
-    fn run(&self, ecs: ECSReference) {
-        let data = ecs.data_mut();
-
-        let query = data.query()
+    fn run(&self, ecs: ECSReference<'_>) -> Result<(), ExecutionError> {
+        let query = ecs
+            .query()
             .read::<Production>()
             .read::<TargetInventory>()
             .write::<Inventory>()
-            .build();
+            .build()?;
 
-        data.for_each_read2_write_1::<Production, TargetInventory, Inventory>(
+        ecs.for_each_read2_write_1::<Production, TargetInventory, Inventory>(
             query,
             |prod, target, inv| {
                 if inv.0 < target.0 {
                     inv.0 += prod.0;
                 }
             },
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -67,21 +69,21 @@ impl System for WagePaymentSystem {
         a
     }
 
-    fn run(&self, ecs: ECSReference) {
-        let data = ecs.data_mut();
-
-        let query = data.query()
+    fn run(&self, ecs: ECSReference<'_>) -> Result<(), ExecutionError> {
+        let query = ecs.query()
             .read::<Production>()
             .read::<Wage>()
             .write::<Cash>()
-            .build();
+            .build()?;
 
-        data.for_each_read2_write_1::<Production, Wage, Cash>(
+        ecs.for_each_read2_write_1::<Production, Wage, Cash>(
             query,
             |prod, wage, cash| {
                 cash.0 -= prod.0 * wage.0;
             },
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -97,22 +99,22 @@ impl System for SpendingSystem {
         a
     }
 
-    fn run(&self, ecs: ECSReference) {
-        let data = ecs.data_mut();
-
-        let query = data.query()
+    fn run(&self, ecs: ECSReference<'_>) -> Result<(), ExecutionError> {
+        let query = ecs.query()
             .read::<AgentTag>()
             .write::<Cash>()
-            .build();
+            .build()?;
 
-        data.for_each_read_write::<AgentTag, Cash>(
+        ecs.for_each_read_write::<AgentTag, Cash>(
             query,
             |_, cash| {
                 if cash.0 >= 1.0 {
                     cash.0 -= 1.0;
                 }
             },
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -123,25 +125,20 @@ impl System for PriceSystem {
 
     fn access(&self) -> AccessSets {
         let mut a = AccessSets::default();
-
         a.read.set(component_id_of::<Inventory>());
         a.read.set(component_id_of::<TargetInventory>());
-
         a.write.set(component_id_of::<Price>());
-
         a
     }
 
-    fn run(&self, ecs: ECSReference) {
-        let data = ecs.data_mut();
-
-        let query = data.query()
+    fn run(&self, ecs: ECSReference<'_>) -> Result<(), ExecutionError> {
+        let query = ecs.query()
             .read::<Inventory>()
             .read::<TargetInventory>()
             .write::<Price>()
-            .build();
+            .build()?;
 
-        data.for_each_read2_write_1::<Inventory, TargetInventory, Price>(
+        ecs.for_each_read2_write_1::<Inventory, TargetInventory, Price>(
             query,
             |inv, target, price| {
                 if inv.0 < target.0 {
@@ -150,7 +147,9 @@ impl System for PriceSystem {
                     price.0 *= 0.99;
                 }
             },
-        );
+        )?;
+
+        Ok(())
     }
 }
 
@@ -166,15 +165,13 @@ impl System for HungerSystem {
         a
     }
 
-    fn run(&self, ecs: ECSReference) {
-        let data = ecs.data_mut();
-
-        let query = data.query()
+    fn run(&self, ecs: ECSReference<'_>) -> Result<(), ExecutionError> {
+        let query = ecs.query()
             .read::<Cash>()
             .write::<Hunger>()
-            .build();
+            .build()?;
 
-        data.for_each_read_write::<Cash, Hunger>(
+        ecs.for_each_read_write::<Cash, Hunger>(
             query,
             |cash, hunger| {
                 if cash.0 >= 0.0 {
@@ -183,13 +180,14 @@ impl System for HungerSystem {
                     hunger.0 += 1.0;
                 }
             },
-        );
+        )?;
+
+        Ok(())
     }
 }
 
-
 #[test]
-fn toy_economy_ecs_abm() {
+fn toy_economy_ecs_abm() -> ECSResult<()> {
     register_component::<Cash>();
     register_component::<Hunger>();
     register_component::<AgentTag>();
@@ -202,12 +200,12 @@ fn toy_economy_ecs_abm() {
     freeze_components();
 
     let shards = EntityShards::new(4);
-    let ecs = ECSManager::new(shards);
+    let data = ECSData::new(shards);
+    let ecs = ECSManager::new(data);
 
-    {
-        let world = ecs.world_ref();
-        let data = world.data_mut();
+    let world = ecs.world_ref();
 
+    world.with_exclusive(|_data| {
         for _ in 0..10 {
             let mut b = Bundle::new();
             b.insert(component_id_of::<FirmTag>(), FirmTag(0));
@@ -218,20 +216,22 @@ fn toy_economy_ecs_abm() {
             b.insert(component_id_of::<TargetInventory>(), TargetInventory(200.0));
             b.insert(component_id_of::<Price>(), Price(1.0));
 
-            data.defer(Command::Spawn { bundle: b });
+            world.defer(Command::Spawn { bundle: b })?;
         }
 
-        for _ in 0..10000 {
+        for _ in 0..10_000 {
             let mut b = Bundle::new();
             b.insert(component_id_of::<AgentTag>(), AgentTag(0));
             b.insert(component_id_of::<Cash>(), Cash(100.0));
             b.insert(component_id_of::<Hunger>(), Hunger(0.0));
 
-            data.defer(Command::Spawn { bundle: b });
+            world.defer(Command::Spawn { bundle: b })?;
         }
 
-    }
-    ecs.apply_deferred_commands();
+        Ok::<(), ExecutionError>(())
+    })??;
+
+    ecs.apply_deferred_commands()?;
 
     let mut scheduler = Scheduler::new();
 
@@ -242,33 +242,32 @@ fn toy_economy_ecs_abm() {
     scheduler.add_system(HungerSystem);
 
     for step in 0..1000 {
-        scheduler.run(&ecs);
+        ecs.run(&mut scheduler)?;
 
         let world = ecs.world_ref();
-        let data = world.data_mut();
 
-        if step == 999 {
-            let sum_bits = AtomicU32::new(0);
-            let count = AtomicU32::new(0);
+        let sum_bits = AtomicU32::new(0);
+        let count = AtomicU32::new(0);
 
-            let query = data.query()
-                .read::<Price>()
-                .read::<FirmTag>()
-                .build();
+        let query = world
+            .query()
+            .read::<Price>()
+            .read::<FirmTag>()
+            .build()?;
 
-            data.for_each_read2::<Price, FirmTag>(
-                query,
-                |price, _| {
-                    sum_bits.fetch_add(price.0.to_bits(), Ordering::Relaxed);
-                    count.fetch_add(1, Ordering::Relaxed);
-                },
-            );
+        world.for_each_read2::<Price, FirmTag>(
+            query,
+            |price, _| {
+                sum_bits.fetch_add(price.0.to_bits(), Ordering::Relaxed);
+                count.fetch_add(1, Ordering::Relaxed);
+            },
+        )?;
 
-            let total = f32::from_bits(sum_bits.load(Ordering::Relaxed));
-            let n = count.load(Ordering::Relaxed) as f32;
-            let avg_price = total / n;
+        let total = f32::from_bits(sum_bits.load(Ordering::Relaxed));
+        let avg = total / count.load(Ordering::Relaxed) as f32;
 
-            println!("{},{}", step, avg_price);
-        }
+        println!("{step},{avg}");
     }
+
+    Ok(())
 }
