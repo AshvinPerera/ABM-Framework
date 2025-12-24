@@ -150,7 +150,7 @@ impl QueryBuilder {
     }
 
     /// Finalizes the query description and returns an immutable [`BuiltQuery`].  
-        pub fn build(mut self) -> ECSResult<BuiltQuery> {
+    pub fn build(mut self) -> ECSResult<BuiltQuery> {
         self.reads.sort_unstable();
         self.writes.sort_unstable();
 

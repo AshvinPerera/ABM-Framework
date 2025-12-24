@@ -100,8 +100,10 @@ use crate::engine::types::{ShardID, ChunkID, RowID, ComponentID};
 /// - missing registrations / factories
 /// - lock poisoning within the registry internals
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
+
     /// Registry has been frozen; registrations are not allowed.
     Frozen,
 
@@ -372,6 +374,7 @@ impl std::error::Error for TypeMismatchError {}
 /// }
 /// ```
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttributeError {
     
@@ -440,6 +443,7 @@ impl From<TypeMismatchError> for AttributeError {
 /// ### Display
 /// Human-readable, single-line messages suitable for logs.
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnError {
 
@@ -559,7 +563,8 @@ impl From<RegistryError> for SpawnError {
 /// These errors generally indicate internal inconsistencies or violated
 /// invariants rather than recoverable user-facing failures.
 
-#[derive(Debug)]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MoveError {
 
     /// Component storage layouts were inconsistent between archetypes.
@@ -688,6 +693,7 @@ impl std::error::Error for MoveError {
 }
 
 /// Kind of component access requested or held during ECS execution.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessKind {
     /// Shared, read-only access to a component.
@@ -720,6 +726,7 @@ pub enum InvalidAccessReason {
 /// * Always deterministic
 /// * Never indicate partial ECS mutation
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionError {
 
@@ -836,6 +843,7 @@ pub type ECSResult<T> = Result<T, ECSError>;
 pub type RegistryResult<T> = Result<T, RegistryError>;
 
 /// Unified error type for the public ECS API.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum ECSError {
     /// Entity spawning error
@@ -848,6 +856,9 @@ pub enum ECSError {
     /// Component registry and component factory errors
     Registry(RegistryError),
 
+    /// Low-level component storage access error
+    Attribute(AttributeError),
+
     /// Internal lock poisoning / invariant failures.
     Internal(Cow<'static, str>),
 }
@@ -859,6 +870,7 @@ impl std::fmt::Display for ECSError {
             ECSError::Execute(e) => write!(f, "execution error: {e}"),
             ECSError::Move(e) => write!(f, "move error: {e}"),
             ECSError::Registry(e) => write!(f, "registry error: {e}"),
+            ECSError::Attribute(e) => write!(f, "attribute error: {e}"),
             ECSError::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -871,6 +883,7 @@ impl std::error::Error for ECSError {
             ECSError::Execute(e) => Some(e),
             ECSError::Move(e) => Some(e),
             ECSError::Registry(e) => Some(e),
+            ECSError::Attribute(e) => Some(e),
             ECSError::Internal(_) => None,
         }
     }
@@ -887,4 +900,7 @@ impl From<MoveError> for ECSError {
 }
 impl From<RegistryError> for ECSError {
     fn from(e: RegistryError) -> Self { ECSError::Registry(e) }
+}
+impl From<AttributeError> for ECSError {
+    fn from(e: AttributeError) -> Self { ECSError::Attribute(e) }
 }

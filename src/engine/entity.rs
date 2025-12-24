@@ -223,7 +223,14 @@ impl Entities {
             i
         } else {
             self.ensure_capacity(1024)?;
-            self.free_store.pop().expect("capacity added must yield a slot.")
+            match self.free_store.pop() {
+                Some(i) => i,
+                None => {
+                    let entities_needed = (self.versions.len() as u64).saturating_add(1);
+                    let capacity = (INDEX_CAP as u64).saturating_add(1);
+                    return Err(CapacityError { entities_needed, capacity });
+                }
+            }
         };
 
         let version = self.versions[index as usize];
@@ -263,7 +270,7 @@ impl Entities {
         }
     }
 
-     /// Returns `true` if the entity is alive and not stale.
+    /// Returns `true` if the entity is alive and not stale.
     pub fn is_alive(&self, entity: Entity) -> bool {
         let (_, i, v) = split_entity(entity);
         let index = i as usize; 
