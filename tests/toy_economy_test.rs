@@ -60,7 +60,7 @@ impl System for ProductionSystem {
             .write::<Inventory>()?
             .build()?;
 
-        ecs.for_each_read2_write_1::<Production, TargetInventory, Inventory>(
+        ecs.for_each_read2_write1::<Production, TargetInventory, Inventory>(
             query,
             |prod, target, inv| {
                 if inv.0 < target.0 {
@@ -94,7 +94,7 @@ impl System for WagePaymentSystem {
             .write::<Cash>()?
             .build()?;
 
-        ecs.for_each_read2_write_1::<Production, Wage, Cash>(
+        ecs.for_each_read2_write1::<Production, Wage, Cash>(
             query,
             |prod, wage, cash| {
                 cash.0 -= prod.0 * wage.0;
@@ -158,7 +158,7 @@ impl System for PriceSystem {
             .write::<Price>()?
             .build()?;
 
-        ecs.for_each_read2_write_1::<Inventory, TargetInventory, Price>(
+        ecs.for_each_read2_write1::<Inventory, TargetInventory, Price>(
             query,
             |inv, target, price| {
                 if inv.0 < target.0 {

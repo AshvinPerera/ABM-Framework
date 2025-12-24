@@ -150,12 +150,15 @@ impl QueryBuilder {
     }
 
     /// Finalizes the query description and returns an immutable [`BuiltQuery`].  
-    pub fn build(mut self) -> ECSResult<BuiltQuery> {
-        self.reads.sort_unstable();
-        self.writes.sort_unstable();
+    pub fn build(self) -> ECSResult<BuiltQuery> {
+        let mut reads_sorted = self.reads.clone();
+        let mut writes_sorted = self.writes.clone();
+
+        reads_sorted.sort_unstable();
+        writes_sorted.sort_unstable();
 
         // Detect duplicates
-        for w in self.reads.windows(2) {
+        for w in reads_sorted.windows(2) {
             if w[0] == w[1] {
                 return Err(ECSError::Execute(ExecutionError::InvalidQueryAccess {
                     component_id: w[0],
@@ -163,7 +166,7 @@ impl QueryBuilder {
                 }));
             }
         }
-        for w in self.writes.windows(2) {
+        for w in writes_sorted.windows(2) {
             if w[0] == w[1] {
                 return Err(ECSError::Execute(ExecutionError::InvalidQueryAccess {
                     component_id: w[0],
@@ -172,12 +175,12 @@ impl QueryBuilder {
             }
         }
 
-        self.reads.dedup();
-        self.writes.dedup();
+        reads_sorted.dedup();
+        writes_sorted.dedup();
 
         // Disallow overlap: read & write same component
-        for component_id in &self.reads {
-            if self.writes.binary_search(component_id).is_ok() {
+        for component_id in &reads_sorted {
+            if writes_sorted.binary_search(component_id).is_ok() {
                 return Err(ECSError::Execute(ExecutionError::InvalidQueryAccess {
                     component_id: *component_id,
                     reason: InvalidAccessReason::ReadAndWrite,

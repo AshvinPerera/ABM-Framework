@@ -206,10 +206,13 @@ impl ECSManager {
 
     /// Runs the given scheduler for one full tick.
     pub fn run(&self, scheduler: &mut Scheduler) -> ECSResult<()> {
-        scheduler.run(self.world_ref()).map_err(ECSError::from)?;
+        let world = self.world_ref();
+
+        scheduler.run(world).map_err(ECSError::from)?;
+        world.clear_borrows();
         self.apply_deferred_commands()?;
         Ok(())
-    } 
+    }
 
     /// Applies all queued deferred commands.
     ///
@@ -287,6 +290,16 @@ pub struct ECSReference<'a> {
 }
 
 impl<'a> ECSReference<'a> {
+
+    /// Clears all component borrows.
+    ///
+    /// ## Semantics
+    /// This marks the end of a scheduler execution stage.
+    /// Must only be called when no systems are running.
+    #[inline]
+    pub(crate) fn clear_borrows(&self) {
+        self.manager.borrows.clear();
+    }
 
     /// Executes a closure with **exclusive access** to the ECS world.
     ///
@@ -419,16 +432,24 @@ impl ECSReference<'_> {
         &self,
         query: BuiltQuery,
         f: impl Fn(&mut A) + Send + Sync,
-    ) -> ECSResult<()> {
+    ) -> ECSResult<()>
+    where
+        A: 'static + Send + Sync,
+    {
         if !query.reads.is_empty() || query.writes.len() != 1 {
             return Err(ECSError::Internal(
-                "for_each_write: query must have exactly 0 reads and 1 write".into(),
+                "for_each_write: expected exactly 0 reads and 1 write".into(),
             ));
         }
 
-        self.for_each_abstraction(query, |_, writes| {
-            let a = unsafe { &mut *(writes[0].as_mut_ptr() as *mut A) };
-            f(a);
+        self.for_each_abstraction(query, move |_, writes| unsafe {
+            let bytes = writes[0].len();
+            let slice =
+                crate::engine::storage::cast_slice_mut::<A>(writes[0].as_mut_ptr(), bytes);
+
+            for item in slice {
+                f(item);
+            }
         })
     }
 
@@ -438,17 +459,28 @@ impl ECSReference<'_> {
         &self,
         query: BuiltQuery,
         f: impl Fn(&A, &B) + Send + Sync,
-    ) -> ECSResult<()> {
+    ) -> ECSResult<()>
+    where
+        A: 'static + Send + Sync,
+        B: 'static + Send + Sync,
+    {
         if query.reads.len() != 2 || !query.writes.is_empty() {
             return Err(ECSError::Internal(
-                "for_each_read2: query must have exactly 2 reads and 0 writes".into(),
+                "for_each_read2: expected exactly 2 reads and 0 writes".into(),
             ));
         }
 
-        self.for_each_abstraction(query, |reads, _| {
-            let a = unsafe { &*(reads[0].as_ptr() as *const A) };
-            let b = unsafe { &*(reads[1].as_ptr() as *const B) };
-            f(a, b);
+        self.for_each_abstraction(query, move |reads, _| unsafe {
+            let a =
+                crate::engine::storage::cast_slice::<A>(reads[0].as_ptr(), reads[0].len());
+            let b =
+                crate::engine::storage::cast_slice::<B>(reads[1].as_ptr(), reads[1].len());
+
+            debug_assert_eq!(a.len(), b.len());
+
+            for i in 0..a.len() {
+                f(&a[i], &b[i]);
+            }
         })
     }
 
@@ -457,37 +489,66 @@ impl ECSReference<'_> {
         &self,
         query: BuiltQuery,
         f: impl Fn(&A, &mut B) + Send + Sync,
-    ) -> ECSResult<()> {
+    ) -> ECSResult<()>
+    where
+        A: 'static + Send + Sync,
+        B: 'static + Send + Sync,
+    {
         if query.reads.len() != 1 || query.writes.len() != 1 {
             return Err(ECSError::Internal(
-                "for_each_read_write: query must have exactly 1 read and 1 write".into(),
+                "for_each_read_write: expected exactly 1 read and 1 write".into(),
             ));
         }
 
-        self.for_each_abstraction(query, |reads, writes| {
-            let a = unsafe { &*(reads[0].as_ptr() as *const A) };
-            let b = unsafe { &mut *(writes[0].as_mut_ptr() as *mut B) };
-            f(a, b);
+        self.for_each_abstraction(query, move |reads, writes| unsafe {
+            let a =
+                crate::engine::storage::cast_slice::<A>(reads[0].as_ptr(), reads[0].len());
+            let b = crate::engine::storage::cast_slice_mut::<B>(
+                writes[0].as_mut_ptr(),
+                writes[0].len(),
+            );
+
+            debug_assert_eq!(a.len(), b.len());
+
+            for i in 0..a.len() {
+                f(&a[i], &mut b[i]);
+            }
         })
     }
 
     /// Executes a parallel iteration over two read-only components and one mutable component.
-    pub fn for_each_read2_write_1<A, B, C>(
+    pub fn for_each_read2_write1<A, B, C>(
         &self,
         query: BuiltQuery,
         f: impl Fn(&A, &B, &mut C) + Send + Sync,
-    ) -> ECSResult<()> {
+    ) -> ECSResult<()>
+    where
+        A: 'static + Send + Sync,
+        B: 'static + Send + Sync,
+        C: 'static + Send + Sync,
+    {
         if query.reads.len() != 2 || query.writes.len() != 1 {
             return Err(ECSError::Internal(
-                "for_each_read2_write_1: query must have exactly 2 reads and 1 write".into(),
+                "for_each_read2_write1: expected exactly 2 reads and 1 write".into(),
             ));
         }
 
-        self.for_each_abstraction(query, |reads, writes| {
-            let a = unsafe { &*(reads[0].as_ptr() as *const A) };
-            let b = unsafe { &*(reads[1].as_ptr() as *const B) };
-            let c = unsafe { &mut *(writes[0].as_mut_ptr() as *mut C) };
-            f(a, b, c);
+        self.for_each_abstraction(query, move |reads, writes| unsafe {
+            let a =
+                crate::engine::storage::cast_slice::<A>(reads[0].as_ptr(), reads[0].len());
+            let b =
+                crate::engine::storage::cast_slice::<B>(reads[1].as_ptr(), reads[1].len());
+            let c = crate::engine::storage::cast_slice_mut::<C>(
+                writes[0].as_mut_ptr(),
+                writes[0].len(),
+            );
+
+            debug_assert_eq!(a.len(), b.len());
+            debug_assert_eq!(a.len(), c.len());
+
+            for i in 0..a.len() {
+                f(&a[i], &b[i], &mut c[i]);
+            }
         })
     }
 
@@ -497,19 +558,40 @@ impl ECSReference<'_> {
         &self,
         query: BuiltQuery,
         f: impl Fn(&A, &B, &mut C, &mut D) + Send + Sync,
-    ) -> ECSResult<()> {
+    ) -> ECSResult<()>
+    where
+        A: 'static + Send + Sync,
+        B: 'static + Send + Sync,
+        C: 'static + Send + Sync,
+        D: 'static + Send + Sync,
+    {
         if query.reads.len() != 2 || query.writes.len() != 2 {
             return Err(ECSError::Internal(
-                "for_each_read2_write2: query must have exactly 2 reads and 2 writes".into(),
+                "for_each_read2_write2: expected exactly 2 reads and 2 writes".into(),
             ));
         }
 
-        self.for_each_abstraction(query, |reads, writes| {
-            let a = unsafe { &*(reads[0].as_ptr() as *const A) };
-            let b = unsafe { &*(reads[1].as_ptr() as *const B) };
-            let c = unsafe { &mut *(writes[0].as_mut_ptr() as *mut C) };
-            let d = unsafe { &mut *(writes[1].as_mut_ptr() as *mut D) };
-            f(a, b, c, d);
+        self.for_each_abstraction(query, move |reads, writes| unsafe {
+            let a =
+                crate::engine::storage::cast_slice::<A>(reads[0].as_ptr(), reads[0].len());
+            let b =
+                crate::engine::storage::cast_slice::<B>(reads[1].as_ptr(), reads[1].len());
+            let c = crate::engine::storage::cast_slice_mut::<C>(
+                writes[0].as_mut_ptr(),
+                writes[0].len(),
+            );
+            let d = crate::engine::storage::cast_slice_mut::<D>(
+                writes[1].as_mut_ptr(),
+                writes[1].len(),
+            );
+
+            debug_assert_eq!(a.len(), b.len());
+            debug_assert_eq!(a.len(), c.len());
+            debug_assert_eq!(a.len(), d.len());
+
+            for i in 0..a.len() {
+                f(&a[i], &b[i], &mut c[i], &mut d[i]);
+            }
         })
     }
 
