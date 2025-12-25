@@ -3,7 +3,7 @@ Syren is a high-performance, data-oriented Agent-Based Modeling (ABM) framework 
 It is designed for large-scale agent-based economic models with millions of agents and employs archetype-based storage for a cache-efficient data layout and 
 deterministic scheduling to ensure reproducible simulation runs. The library is written in Rust, leveraging safe, explicit data access to ensure memory safety.
 
-The library targtes economists, social scientists, and researchers who need a scalable simulation toolkit for agent-based modeling (especially economic systems). 
+The library targets economists, social scientists, and researchers who need a scalable simulation toolkit for agent-based modeling (especially economic systems). 
 The crate builds as both an rlib and a cdylib. A stable C-compatible FFI API is planned but not yet exposed.
 
 Note: 
