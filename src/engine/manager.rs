@@ -957,13 +957,13 @@ impl ECSData {
     ) -> Result<(), ExecutionError> {
         let matches = self.matching_archetypes(&query.signature)?;
 
-        // Share callback across spawned tasks without moving it.
+        // Share callback across spawned tasks
         let f = Arc::new(f);
 
         for matched_archetype in matches {
             let archetype = &self.archetypes[matched_archetype.archetype_id as usize];
 
-            // ---- Acquire guards once per archetype ----
+            // Acquire guards
             let mut read_guards: Vec<RwLockReadGuard<'_, Box<dyn TypeErasedAttribute>>> =
                 Vec::with_capacity(query.reads.len());
             let mut write_guards: Vec<RwLockWriteGuard<'_, Box<dyn TypeErasedAttribute>>> =
@@ -993,7 +993,6 @@ impl ECSData {
                 write_guards.push(guard);
             }
 
-            // ---- Discover chunk sizes ----
             let chunk_count = archetype
                 .chunk_count()
                 .map_err(|_| ExecutionError::InternalExecutionError)?;
@@ -1010,7 +1009,7 @@ impl ECSData {
                 chunk_lens.push(len);
             }
 
-            // ---- Precompute pointers (address as usize is Send/Sync) ----
+            // Precompute pointers
             let n_reads = read_guards.len();
             let n_writes = write_guards.len();
 
@@ -1058,20 +1057,10 @@ impl ECSData {
                 write_ptrs,
             };
 
-            // ---- Error latch (rare path) ----
             let abort = Arc::new(AtomicBool::new(false));
             let err: Arc<Mutex<Option<ExecutionError>>> = Arc::new(Mutex::new(None));
-
-            // ---- Phase 2/3 performance fix: batch chunks into fewer tasks ----
-            //
-            // Use a coarse grainsize so each task does enough work to amortize
-            // Rayon scheduling overhead. This is the main reason your run got slower.
             let threads = rayon::current_num_threads().max(1);
-
-            // heuristic: at least 8 chunks per task, or distribute evenly
             let grainsize = (views.chunk_count / threads).max(8);
-
-            // Borrow views by reference (avoid moving Vecs into closures).
             let views_ref = &views;
 
             rayon::scope(|s| {
@@ -1085,7 +1074,6 @@ impl ECSData {
                     let views = views_ref;
 
                     s.spawn(move |_| {
-                        // Allocate these ONCE per task (not per chunk).
                         let mut read_views: Vec<&[u8]> = Vec::with_capacity(views.n_reads);
                         let mut write_views: Vec<&mut [u8]> = Vec::with_capacity(views.n_writes);
 
@@ -1108,7 +1096,6 @@ impl ECSData {
                                 continue;
                             }
 
-                            // Reuse Vec allocations (no heap alloc here).
                             read_views.clear();
                             write_views.clear();
 
