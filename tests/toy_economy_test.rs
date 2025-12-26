@@ -226,7 +226,7 @@ fn toy_economy_ecs_abm() -> ECSResult<()> {
     let world = ecs.world_ref();
 
     world.with_exclusive(|_| -> Result<(), ECSError> {
-        for _ in 0..10 {
+        for _ in 0..100 {
             let mut b = Bundle::new();
             b.insert(component_id_of::<FirmTag>()?, FirmTag(0));
             b.insert(component_id_of::<Cash>()?, Cash(10_000.0));
@@ -238,7 +238,7 @@ fn toy_economy_ecs_abm() -> ECSResult<()> {
             world.defer(Command::Spawn { bundle: b })?;
         }
 
-        for _ in 0..10_000 {
+        for _ in 0..1_000_000 {
             let mut b = Bundle::new();
             b.insert(component_id_of::<AgentTag>()?, AgentTag(0));
             b.insert(component_id_of::<Cash>()?, Cash(100.0));
