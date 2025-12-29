@@ -4,7 +4,7 @@ It is designed for large-scale agent-based economic models with millions of agen
 deterministic scheduling to ensure reproducible simulation runs. The library is written in Rust, leveraging safe, explicit data access to ensure memory safety.
 
 The library targets economists, social scientists, and researchers who need a scalable simulation toolkit for agent-based modeling (especially economic systems). 
-The crate builds as both an rlib and a cdylib. A stable C-compatible FFI API is planned but not yet exposed.
+The crate builds as both an rlib and a cdylib.
 
 Note: 
 - This is currently a hobby project of mine to both 1. learn the internals of a scalable agent based modeling framework, and 2. to develop my own 
