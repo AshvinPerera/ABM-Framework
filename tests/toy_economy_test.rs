@@ -1,5 +1,3 @@
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use abm_framework::engine::component::{
     Bundle, register_component, freeze_components, component_id_of,
 };
@@ -9,6 +7,7 @@ use abm_framework::engine::systems::{AccessSets, System};
 use abm_framework::engine::scheduler::Scheduler;
 use abm_framework::engine::commands::Command;
 use abm_framework::engine::error::{ECSError, ECSResult};
+use abm_framework::engine::reduce::{Count, Sum};
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
@@ -262,26 +261,29 @@ fn toy_economy_ecs_abm() -> ECSResult<()> {
         ecs.run(&mut scheduler)?;
 
         let world = ecs.world_ref();
-        let sum = AtomicU32::new(0);
-        let count = AtomicU32::new(0);
 
         let qb = world.query()?;
         let query = qb
             .read::<Price>()?
-            .read::<FirmTag>()?
             .build()?;
 
-        world.for_each_read2::<Price, FirmTag>(
-            query,
-            |price, _| {
-                sum.fetch_add(price.0.to_bits(), Ordering::Relaxed);
-                count.fetch_add(1, Ordering::Relaxed);
-            },
+        // Sum of prices
+        let sum = world.reduce_read::<Price, Sum>(
+            query.clone(),
+            Sum::default,
+            |acc, price| acc.0 += price.0 as f64,
+            |a, b| a.0 += b.0,
         )?;
 
-        let avg = f32::from_bits(sum.load(Ordering::Relaxed))
-            / count.load(Ordering::Relaxed) as f32;
+        // Count of firms
+        let count = world.reduce_read::<Price, Count>(
+            query,
+            Count::default,
+            |acc, _| acc.0 += 1,
+            |a, b| a.0 += b.0,
+        )?;
 
+        let avg = sum.0 / count.0 as f64;
         println!("{step},{avg}");
     }
 

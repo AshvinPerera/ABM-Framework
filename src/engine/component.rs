@@ -104,7 +104,11 @@ impl Bundle {
     #[inline]
     pub fn insert<T: Any + Send>(&mut self, component_id: ComponentID, value: T) {
         self.signature.set(component_id);
-        self.values.push((component_id, Box::new(value)));
+        if let Some((_, slot)) = self.values.iter_mut().find(|(cid, _)| *cid == component_id) {
+            *slot = Box::new(value);
+        } else {
+            self.values.push((component_id, Box::new(value)));
+        }
     }
 
     /// Inserts multiple component values from an iterator.
@@ -390,6 +394,11 @@ pub fn register_component<T: 'static + Send + Sync>() -> ECSResult<ComponentID> 
     let mut registry = registry
         .write()
         .map_err(|_| RegistryError::PoisonedLock)?;
+
+    if std::mem::size_of::<T>() == 0 {
+        return Err(RegistryError::ZeroSizedComponent { type_id: TypeId::of::<T>() }.into());
+    }
+    
     Ok(registry.register::<T>()?)
 }
 
