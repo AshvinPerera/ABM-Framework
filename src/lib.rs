@@ -19,6 +19,7 @@
 #![deny(dead_code)]
 
 pub mod engine;
+pub mod gpu;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Re-exports (Public API)

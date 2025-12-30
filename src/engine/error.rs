@@ -799,6 +799,29 @@ pub enum ExecutionError {
         what: &'static str,
     },
 
+    /// GPU execution requested but crate was built without `--features gpu`.
+    GpuNotEnabled,
+
+    /// Component used by GPU system is not registered as GPU-safe.
+    GpuUnsupportedComponent {
+        /// component ID of the unsupported component.
+        component_id: ComponentID,
+        /// text name of the unsupported component.
+        name: &'static str,
+    },
+
+    /// GPU init failed.
+    GpuInitFailed {
+        /// initialization failure reason.
+        message: std::borrow::Cow<'static, str>,
+    },
+
+    /// GPU dispatch failed.
+    GpuDispatchFailed {
+        /// dispatch failure reason.
+        message: std::borrow::Cow<'static, str>,
+    },
+
     /// Unsafe execution path was invoked incorrectly.
     InternalExecutionError,
 }
@@ -835,6 +858,14 @@ impl fmt::Display for ExecutionError {
             }
 
             ExecutionError::LockPoisoned { what } => write!(f, "lock poisoned: {}", what),
+                        ExecutionError::GpuNotEnabled => {
+                f.write_str("GPU execution requested but the `gpu` feature has not been enabled")
+            }
+            ExecutionError::GpuUnsupportedComponent { component_id, name } => {
+                write!(f, "component {} ({}) is not GPU-safe (register_gpu_component required)", component_id, name)
+            }
+            ExecutionError::GpuInitFailed { message } => write!(f, "GPU initialization failed: {}", message),
+            ExecutionError::GpuDispatchFailed { message } => write!(f, "GPU dispatch failed: {}", message),
             ExecutionError::InternalExecutionError => f.write_str("internal ECS execution error"),
             
         }

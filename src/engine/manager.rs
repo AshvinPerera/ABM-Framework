@@ -264,7 +264,7 @@ impl ECSManager {
     #[inline]
     unsafe fn data_mut_unchecked(&self) -> &mut ECSData {
         unsafe{ &mut *self.inner.get() }
-    }     
+    }    
 }
 
 /// A non-owning handle granting access to ECS data.
@@ -292,6 +292,11 @@ impl<'a> ECSReference<'a> {
     #[inline]
     pub(crate) fn clear_borrows(&self) {
         self.manager.borrows.clear();
+    }
+
+    #[inline]
+    pub(crate) fn apply_deferred_commands(&self) -> ECSResult<()> {
+        self.manager.apply_deferred_commands()
     }
 
     /// Executes a closure with **exclusive access** to the ECS world.
@@ -1473,5 +1478,17 @@ impl ECSData {
         }
 
         Ok(out)
+    }
+
+    #[cfg(feature = "gpu")]
+    #[inline]
+    pub(crate) fn archetypes(&self) -> &[Archetype] {
+        &self.archetypes
+    }
+
+    #[cfg(feature = "gpu")]    
+    #[inline]
+    pub(crate) fn archetypes_mut(&mut self) -> &mut [Archetype] {
+        &mut self.archetypes
     }
 }

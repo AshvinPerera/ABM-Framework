@@ -33,8 +33,24 @@ use rayon::prelude::*;
 use crate::engine::manager::ECSReference;
 use crate::engine::systems::{AccessSets, System, SystemBackend};
 use crate::engine::component::Signature;
-use crate::engine::error::{ECSResult, ECSError};
+use crate::engine::error::{ECSResult, ECSError, ExecutionError};
 
+#[cfg(feature = "gpu")]
+use crate::gpu;
+
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageType {
+    BOUNDARY,
+    CPU,
+    GPU,
+}
+
+impl Default for StageType {
+    fn default() -> Self {
+        StageType::CPU
+    }
+}
 
 /// A logical execution stage used by [`Scheduler`] during planning.
 ///
@@ -45,17 +61,33 @@ use crate::engine::error::{ECSResult, ECSError};
 /// - evolve into a CPU/GPU multi-backend dispatcher.
 #[derive(Clone, Debug, Default)]
 pub struct Stage {
+    
+    stage_type: StageType,
     /// Indices of systems that can execute in parallel.
     pub system_indices: Vec<usize>,
-    /// Aggregate access sets of systems in this stage (used for fast conflict checks
-    /// during plan construction).
+    /// Aggregate access sets of systems in this stage (CPU)
     aggregate_access: AccessSets,
 }
 
 impl Stage {
+    fn boundary() -> Self {
+        Self { stage_type: StageType::BOUNDARY, system_indices: Vec::new(), aggregate_access: AccessSets::default() }
+    }
+
+    fn cpu() -> Self {
+        Self { stage_type: StageType::CPU, system_indices: Vec::new(), aggregate_access: AccessSets::default() }
+    }
+
+    fn gpu(idx: usize, access: AccessSets) -> Self {
+        let mut s = Self { stage_type: StageType::GPU, system_indices: vec![idx], aggregate_access: AccessSets::default() };
+        s.aggregate_access = access;
+        s
+    }
+
     /// Returns true if `access` does NOT conflict with anything already in this stage.
     #[inline]
     pub fn can_accept(&self, access: &AccessSets) -> bool {
+        debug_assert_eq!(self.stage_type, StageType::CPU);
         !access.conflicts_with(&self.aggregate_access)
     }
 
@@ -70,7 +102,7 @@ impl Stage {
     /// Returns true if this stage is acting as a boundary marker.
     #[inline]
     pub fn is_boundary(&self) -> bool {
-        self.system_indices.is_empty()
+        self.stage_type == StageType::BOUNDARY
     }
 }
 
@@ -78,9 +110,9 @@ impl Stage {
 /// based on declared access sets, and executes stages with parallelism.
 pub struct Scheduler {
     systems: Vec<Box<dyn System>>,
-    /// Cached CPU stages.
-    cpu_stages: Vec<Stage>,
-    /// Whether `cpu_stages` needs rebuilding.
+    /// Cached stages.
+    plan: Vec<Stage>,
+    /// Whether `plan` needs rebuilding.
     dirty: bool,
 }
 
@@ -96,7 +128,7 @@ impl Scheduler {
     pub fn new() -> Self {
         Self {
             systems: Vec::new(),
-            cpu_stages: Vec::new(),
+            plan: Vec::new(),
             dirty: true,
         }
     }
@@ -117,7 +149,7 @@ impl Scheduler {
     #[inline]
     pub fn clear(&mut self) {
         self.systems.clear();
-        self.cpu_stages.clear();
+        self.plan.clear();
         self.dirty = true;
     }
 
@@ -192,45 +224,41 @@ impl Scheduler {
             return;
         }
 
-        // Deterministic: sort indices by system ID.
         let mut indices: Vec<usize> = (0..self.systems.len()).collect();
         indices.sort_by_key(|&i| self.systems[i].id());
 
-        self.cpu_stages.clear();
+        self.plan.clear();
 
-        for idx in indices {
-            let sys = &self.systems[idx];
+        for index in indices {
+            let system = &self.systems[index];
+            let access = system.access();
 
-            // For GPU scaling: keep GPU systems as hard boundaries.
-            if sys.backend() == SystemBackend::GPU {
-                // Flush any pending CPU stage and create a boundary stage.
-                self.cpu_stages.push(Stage::default());
-
-                let mut stage = Stage::default();
-                stage.push(idx, &sys.access());
-                self.cpu_stages.push(stage);
-
-                continue;
-            }
-
-            let access = sys.access();
-
-            // Greedy packing into the first compatible stage.
-            let mut placed = false;
-            for stage in self.cpu_stages.iter_mut() {
-                if stage.system_indices.is_empty() {
-                    continue;
+            match system.backend() {
+                SystemBackend::CPU => {
+                    // Place into first compatible CPU stage
+                    let mut placed = false;
+                    for stage in self.plan.iter_mut() {
+                        if stage.stage_type != StageType::CPU { continue; }
+                        if stage.can_accept(&access) {
+                            stage.push(index, &access);
+                            placed = true;
+                            break;
+                        }
+                    }
+                    
+                    if !placed {
+                        let mut stage = Stage::cpu();
+                        stage.push(index, &access);
+                        self.plan.push(stage);
+                    }
                 }
-                if stage.can_accept(&access) {
-                    stage.push(idx, &access);
-                    placed = true;
-                    break;
+
+                SystemBackend::GPU => {
+                    // Boundaries are forced around every GPU system
+                    self.plan.push(Stage::boundary());
+                    self.plan.push(Stage::gpu(index, access));
+                    self.plan.push(Stage::boundary());
                 }
-            }
-            if !placed {
-                let mut stage = Stage::default();
-                stage.push(idx, &access);
-                self.cpu_stages.push(stage);
             }
         }
 
@@ -250,19 +278,43 @@ impl Scheduler {
     pub fn run(&mut self, ecs: ECSReference<'_>) -> ECSResult<()> {
         self.rebuild();
 
-        for stage in &self.cpu_stages {
-            if stage.system_indices.is_empty() {
-                continue;
+        for stage in &self.plan {
+            match stage.stage_type {
+                StageType::BOUNDARY => {
+                    ecs.clear_borrows();
+                    ecs.apply_deferred_commands()?;
+                }
+
+                StageType::CPU => {
+                    stage.system_indices.par_iter().try_for_each(|&i| self.systems[i].run(ecs))?;
+                    ecs.clear_borrows();
+                }
+
+                StageType::GPU => {
+                    if stage.system_indices.len() != 1 {
+                        return Err(ECSError::from(ExecutionError::SchedulerInvariantViolation));
+                    }
+
+                    let idx = stage.system_indices[0];
+                    let sys = &self.systems[idx];
+
+                    #[cfg(not(feature = "gpu"))]
+                    {
+                        let _ = sys;
+                        return Err(ECSError::from(ExecutionError::GpuNotEnabled));
+                    }
+
+                    #[cfg(feature = "gpu")]
+                    {
+                        let gpu_cap = sys.gpu().ok_or_else(|| {
+                            ECSError::from(ExecutionError::SchedulerInvariantViolation)
+                        })?;
+
+                        gpu::execute_gpu_system(ecs, sys.as_ref(), gpu_cap)?;
+                        ecs.clear_borrows();
+                    }
+                }
             }
-
-            stage
-                .system_indices
-                .par_iter()
-                .try_for_each(|&system_idx| -> ECSResult<()> {
-                    self.systems[system_idx].run(ecs)
-                })?;
-
-            ecs.clear_borrows();
         }
 
         Ok(())
@@ -271,10 +323,10 @@ impl Scheduler {
 
 #[inline]
 fn or_signature_in_place(
-    dst: &mut Signature,
-    src: &Signature
+    destination: &mut Signature,
+    source: &Signature
 ) {
-    for (d, s) in dst.components.iter_mut().zip(src.components.iter()) {
+    for (d, s) in destination.components.iter_mut().zip(source.components.iter()) {
         *d |= *s;
     }
 }

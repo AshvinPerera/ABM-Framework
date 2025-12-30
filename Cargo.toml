@@ -9,15 +9,19 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 rayon = "1.7.0"
+wgpu = { version = "27.0.1", optional = true }
+bytemuck = { version = "1.16", features = ["derive"], optional = true }
+pollster = { version = "0.4.0", optional = true }
 
 [dev-dependencies]
 proptest = "1.9.0"
-insta = { version = "1.44.3", features = ["json"] }
+insta = { version = "1.45.1", features = ["json"] }
 criterion = "0.8.1"
 
 [features]
 default = []
 rollback = []
+gpu = ["wgpu", "bytemuck", "pollster"]
 
 [[bench]]
 name = "spawn"
