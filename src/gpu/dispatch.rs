@@ -220,13 +220,17 @@ fn dispatch_over_archetypes(
     reads.sort_unstable();
     writes.sort_unstable();
 
-    let binding_count = reads.len() + writes.len() + 1;
+    let read_count = reads.len();
+    let write_count = writes.len();
+    let binding_count = read_count + write_count + 1;
+
     let (pipeline, bind_group_layout) = run_time.pipelines.get_or_create(
         &run_time.context,
         system_id,
         gpu.shader(),
         gpu.entry_point(),
-        binding_count,
+        read_count,
+        write_count,
     )?;
 
     for archetype in archetypes {

@@ -73,7 +73,7 @@ use crate::gpu::context::GPUContext;
 
 #[derive(Debug)]
 pub struct PipelineCache {
-    map: HashMap<(SystemID, usize), (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    map: HashMap<(SystemID, usize, usize), (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
 }
 
 impl PipelineCache {
@@ -107,17 +107,22 @@ impl PipelineCache {
         system_id: SystemID,
         shader_wgsl: &'static str,
         entry_point: &'static str,
-        binding_count: usize,
+        read_count: usize,
+        write_count: usize,
     ) -> ECSResult<(&wgpu::ComputePipeline, &wgpu::BindGroupLayout)> {
-        if !self.map.contains_key(&(system_id, binding_count)) {
-            let (pipeline, bind_group_layout) = 
-            create_pipeline(context, shader_wgsl, entry_point, binding_count)
-                .map_err(|e| ECSError::from(ExecutionError::GpuDispatchFailed { message: e.into() }))?;
-            self.map.insert((system_id, binding_count), (pipeline, bind_group_layout));
+        let key = (system_id, read_count, write_count);
+
+        if !self.map.contains_key(&key) {
+            let (pipeline, bind_group_layout) =
+                create_pipeline(context, shader_wgsl, entry_point, read_count, write_count)
+                    .map_err(|e| {
+                        ECSError::from(ExecutionError::GpuDispatchFailed { message: e.into() })
+                    })?;
+
+            self.map.insert(key, (pipeline, bind_group_layout));
         }
-        
-        let (compute_pipeline, layout) = self.map.get(&(system_id, binding_count)).unwrap();
-        
+
+        let (compute_pipeline, layout) = self.map.get(&key).unwrap();
         Ok((compute_pipeline, layout))
     }
 }
@@ -141,13 +146,35 @@ fn create_pipeline(
     context: &GPUContext,
     shader_wgsl: &'static str,
     entry_point: &'static str,
-    binding_count: usize,
+    read_count: usize,
+    write_count: usize,
 ) -> Result<(wgpu::ComputePipeline, wgpu::BindGroupLayout), String> {
+    let binding_count = read_count + write_count + 1; // +1 for params
+    if binding_count == 0 {
+        return Err("create_pipeline: binding_count == 0".into());
+    }
+
     let mut entries = Vec::with_capacity(binding_count);
 
-    for i in 0..(binding_count - 1) {
+    // Read-only storage bindings
+    for i in 0..read_count {
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: i as u32,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
+    }
+
+    // Read-write storage bindings
+    for j in 0..write_count {
+        let binding = (read_count + j) as u32;
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -158,6 +185,7 @@ fn create_pipeline(
         });
     }
 
+    // Uniform params
     entries.push(wgpu::BindGroupLayoutEntry {
         binding: (binding_count - 1) as u32,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -169,38 +197,30 @@ fn create_pipeline(
         count: None,
     });
 
-    let bgl = context.device.create_bind_group_layout(
-        &wgpu::BindGroupLayoutDescriptor {
-            label: Some("abm_bind_group_layout"),
-            entries: &entries,
-        }
-    );
+    let bgl = context.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("abm_bind_group_layout"),
+        entries: &entries,
+    });
 
-    let pl = context.device.create_pipeline_layout(
-        &wgpu::PipelineLayoutDescriptor {
-            label: Some("abm_pipeline_layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
-        }
-    );
+    let pl = context.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("abm_pipeline_layout"),
+        bind_group_layouts: &[&bgl],
+        push_constant_ranges: &[],
+    });
 
-    let module = context.device.create_shader_module(
-        wgpu::ShaderModuleDescriptor {
-            label: Some("abm_shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_wgsl.into()),
-        }
-    );
+    let module = context.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("abm_shader"),
+        source: wgpu::ShaderSource::Wgsl(shader_wgsl.into()),
+    });
 
-    let pipeline = context.device.create_compute_pipeline(
-        &wgpu::ComputePipelineDescriptor {
-            label: Some("abm_compute_pipeline"),
-            layout: Some(&pl),
-            module: &module,
-            entry_point: Some(entry_point),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        }
-    );
+    let pipeline = context.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("abm_compute_pipeline"),
+        layout: Some(&pl),
+        module: &module,
+        entry_point: Some(entry_point),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
 
     Ok((pipeline, bgl))
 }

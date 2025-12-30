@@ -9,6 +9,12 @@ use crate::engine::types::{ArchetypeID, ComponentID, ChunkID};
 
 use crate::gpu::context::GPUContext;
 
+
+#[inline]
+fn align_to_4(bytes: usize) -> usize {
+    (bytes + 3) & !3
+}
+
 #[derive(Debug)]
 struct BufferEntry {
     buffer: wgpu::Buffer,
@@ -94,7 +100,7 @@ impl Mirror {
         let len = archetype.length()?;
         if len == 0 { return Ok(()); }
 
-        let bytes_total = len * component_size;
+        let bytes_total = align_to_4(len * component_size);
         self.ensure_buffer(context, archetype.archetype_id(), component_id, bytes_total);
 
         let storage = self.buffers.get(&(archetype.archetype_id(), component_id)).unwrap();
@@ -128,7 +134,7 @@ impl Mirror {
         let len = archetype.length()?;
         if len == 0 { return Ok(()); }
 
-        let bytes_total = len * component_size;
+        let bytes_total = align_to_4(len * component_size);
         self.ensure_buffer(context, archetype.archetype_id(), component_id, bytes_total);
 
         let storage = self.buffers.get(&(archetype.archetype_id(), component_id)).unwrap();
