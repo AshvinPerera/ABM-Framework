@@ -89,7 +89,14 @@ use std::borrow::Cow;
 use std::fmt;
 use std::any::TypeId;
 
-use crate::engine::types::{ShardID, ChunkID, RowID, ComponentID};
+use crate::engine::types::{
+    ShardID, 
+    ChunkID, 
+    RowID, 
+    ComponentID,
+    ArchetypeID,
+    GPUAccessMode
+};
 
 
 /// Errors from the global component registry and its factories.
@@ -822,6 +829,18 @@ pub enum ExecutionError {
         message: std::borrow::Cow<'static, str>,
     },
 
+    /// A required GPU buffer was missing during dispatch.
+    GpuMissingBuffer {
+        /// Archetype for which the GPU buffer was requested.
+        archetype_id: ArchetypeID,
+
+        /// Component whose GPU buffer was missing.
+        component_id: ComponentID,
+
+        /// Intended GPU access mode for the missing buffer.
+        access: GPUAccessMode,
+    },
+
     /// Unsafe execution path was invoked incorrectly.
     InternalExecutionError,
 }
@@ -866,6 +885,15 @@ impl fmt::Display for ExecutionError {
             }
             ExecutionError::GpuInitFailed { message } => write!(f, "GPU initialization failed: {}", message),
             ExecutionError::GpuDispatchFailed { message } => write!(f, "GPU dispatch failed: {}", message),
+            ExecutionError::GpuMissingBuffer {
+                archetype_id,
+                component_id,
+                access,
+            } => write!(
+                f,
+                "GPU dispatch failed: missing {:?} buffer for component {} in archetype {}",
+                access, component_id, archetype_id
+            ),
             ExecutionError::InternalExecutionError => f.write_str("internal ECS execution error"),
             
         }

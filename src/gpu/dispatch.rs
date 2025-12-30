@@ -53,6 +53,7 @@ use crate::engine::component::Signature;
 use crate::engine::error::{ECSResult, ECSError, ExecutionError};
 use crate::engine::manager::ECSReference;
 use crate::engine::systems::{System, GpuSystem};
+use crate::engine::types::{GPUAccessMode};
 
 use crate::gpu::context::GPUContext;
 use crate::gpu::mirror::Mirror;
@@ -245,10 +246,19 @@ fn dispatch_over_archetypes(
         let mut entries: Vec<wgpu::BindGroupEntry> = Vec::with_capacity(binding_count);
 
         for (i, &component_id) in reads.iter().enumerate() {
-            let buffer = run_time.mirror.buffer_for(archetype.archetype_id(), component_id)
-                .ok_or_else(|| ECSError::from(ExecutionError::GpuDispatchFailed {
-                    message: "missing read buffer".into()
-                }))?;
+            let archetype_id = archetype.archetype_id();
+
+            let buffer = run_time
+                .mirror
+                .buffer_for(archetype_id, component_id)
+                .ok_or_else(|| {
+                    ECSError::from(ExecutionError::GpuMissingBuffer {
+                        archetype_id,
+                        component_id,
+                        access: GPUAccessMode::Read,
+                    })
+                })?;
+
             entries.push(wgpu::BindGroupEntry {
                 binding: i as u32,
                 resource: buffer.as_entire_binding(),
@@ -257,10 +267,19 @@ fn dispatch_over_archetypes(
 
         let base = reads.len();
         for (j, &component_id) in writes.iter().enumerate() {
-            let buffer = run_time.mirror.buffer_for(archetype.archetype_id(), component_id)
-                .ok_or_else(|| ECSError::from(ExecutionError::GpuDispatchFailed {
-                    message: "missing write buffer".into()
-                }))?;
+            let archetype_id = archetype.archetype_id();
+
+            let buffer = run_time
+                .mirror
+                .buffer_for(archetype_id, component_id)
+                .ok_or_else(|| {
+                    ECSError::from(ExecutionError::GpuMissingBuffer {
+                        archetype_id,
+                        component_id,
+                        access: GPUAccessMode::Write,
+                    })
+                })?;
+
             entries.push(wgpu::BindGroupEntry {
                 binding: (base + j) as u32,
                 resource: buffer.as_entire_binding(),
