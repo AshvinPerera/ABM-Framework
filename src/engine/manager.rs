@@ -98,6 +98,8 @@ use crate::engine::error::{
     SpawnError
 };
 
+#[cfg(feature = "gpu")]
+use crate::engine::dirty::DirtyChunks;
 
 
 /// Per-archetype precomputed view into chunk memory.
@@ -264,7 +266,7 @@ impl ECSManager {
     #[inline]
     unsafe fn data_mut_unchecked(&self) -> &mut ECSData {
         unsafe{ &mut *self.inner.get() }
-    }     
+    }    
 }
 
 /// A non-owning handle granting access to ECS data.
@@ -292,6 +294,11 @@ impl<'a> ECSReference<'a> {
     #[inline]
     pub(crate) fn clear_borrows(&self) {
         self.manager.borrows.clear();
+    }
+
+    #[inline]
+    pub(crate) fn apply_deferred_commands(&self) -> ECSResult<()> {
+        self.manager.apply_deferred_commands()
     }
 
     /// Executes a closure with **exclusive access** to the ECS world.
@@ -725,6 +732,44 @@ impl ECSReference<'_> {
         )
     }
 
+    /// Executes a typed, parallel reduction over two read-only components.
+    pub fn reduce_read2<A, B, R>(
+        &self,
+        query: BuiltQuery,
+        init: impl Fn() -> R + Send + Sync,
+        fold: impl Fn(&mut R, &A, &B) + Send + Sync,
+        combine: impl Fn(&mut R, R) + Send + Sync,
+    ) -> ECSResult<R>
+    where
+        A: 'static + Send + Sync,
+        B: 'static + Send + Sync,
+        R: Send + 'static,
+    {
+        if query.reads.len() != 2 || !query.writes.is_empty() {
+            return Err(ECSError::Internal(
+                "reduce_read2: requires exactly 2 reads and 0 writes".into(),
+            ));
+        }
+
+        self.reduce_abstraction(
+            query,
+            init,
+            move |acc, cols, _| unsafe {
+                let slice_a =
+                    crate::engine::storage::cast_slice::<A>(cols[0].as_ptr(), cols[0].len());
+                let slice_b =
+                    crate::engine::storage::cast_slice::<B>(cols[1].as_ptr(), cols[1].len());
+
+                debug_assert_eq!(slice_a.len(), slice_b.len());
+
+                for i in 0..slice_a.len() {
+                    fold(acc, &slice_a[i], &slice_b[i]);
+                }
+            },
+            combine,
+        )
+    }
+
 }
 
 /// RAII guard representing the ECS read phase.
@@ -756,6 +801,10 @@ pub struct ECSData {
     shards: EntityShards,
 
     next_spawn_shard: ShardID,
+
+    /// Chunk-level dirty tracking for CPU writes.
+    #[cfg(feature = "gpu")]
+    gpu_dirty_chunks: DirtyChunks,    
 }
 
 impl ECSData {
@@ -774,6 +823,9 @@ impl ECSData {
             signature_map: HashMap::new(),
             shards,
             next_spawn_shard: 0,
+
+            #[cfg(feature = "gpu")]
+            gpu_dirty_chunks: DirtyChunks::new(),
         }
     }
 
@@ -782,6 +834,13 @@ impl ECSData {
         let shard = self.next_spawn_shard;
         self.next_spawn_shard = (self.next_spawn_shard + 1) % (self.shards.shard_count() as u16);
         shard
+    }
+
+    #[cfg(feature = "gpu")]
+    /// Returns GPU dirty chunks 
+    #[inline]
+    pub fn gpu_dirty_chunks(&self) -> &DirtyChunks {
+        &self.gpu_dirty_chunks
     }
 
     /// Returns mutable references to two distinct archetypes.
@@ -1079,6 +1138,12 @@ impl ECSData {
             }
         }
 
+        #[cfg(feature = "gpu")]
+        {
+            // Structural changes invalidate all prior dirty tracking.
+            self.gpu_dirty_chunks.notify_world_changed();
+        }
+
         Ok(())
     }
 
@@ -1210,6 +1275,16 @@ impl ECSData {
             let grainsize = (views.chunk_count / threads).max(8);
             let views_ref = &views;
 
+            #[cfg(feature = "gpu")]
+            let dirty = self.gpu_dirty_chunks();
+
+            #[cfg(feature = "gpu")]
+            let archetype_id: ArchetypeID = matched_archetype.archetype_id;
+
+            #[cfg(feature = "gpu")]
+            let write_component_ids: std::sync::Arc<Vec<ComponentID>> =
+                std::sync::Arc::new(query.writes.clone());
+
             rayon::scope(|s| {
                 let mut start = 0usize;
                 while start < views_ref.chunk_count {
@@ -1219,6 +1294,9 @@ impl ECSData {
                     let err = err.clone();
                     let f = f.clone();
                     let views = views_ref;
+
+                    #[cfg(feature = "gpu")]
+                    let write_component_ids = write_component_ids.clone();
 
                     s.spawn(move |_| {
                         let mut read_views: Vec<&[u8]> = Vec::with_capacity(views.n_reads);
@@ -1264,6 +1342,16 @@ impl ECSData {
                                     return;
                                 }
                                 unsafe { write_views.push(std::slice::from_raw_parts_mut(ptr, bytes)); }
+                            }
+
+                            // Mark dirty chunks for all write components touched by this query.
+                            #[cfg(feature = "gpu")]
+                            {
+                                if views.n_writes != 0 {
+                                    for &component_id in write_component_ids.as_slice() {
+                                        dirty.mark_chunk_dirty(archetype_id, component_id, chunk, views.chunk_count);
+                                    }
+                                }
                             }
 
                             // Call user callback
@@ -1473,5 +1561,17 @@ impl ECSData {
         }
 
         Ok(out)
+    }
+
+    #[cfg(feature = "gpu")]
+    #[inline]
+    pub(crate) fn archetypes(&self) -> &[Archetype] {
+        &self.archetypes
+    }
+
+    #[cfg(feature = "gpu")]    
+    #[inline]
+    pub(crate) fn archetypes_mut(&mut self) -> &mut [Archetype] {
+        &mut self.archetypes
     }
 }

@@ -402,6 +402,87 @@ pub fn register_component<T: 'static + Send + Sync>() -> ECSResult<ComponentID> 
     Ok(registry.register::<T>()?)
 }
 
+/// Marker trait for component types that are safe to transfer to and from the GPU.
+///
+/// ## Purpose
+/// `GPUPod` marks a component as **plain-old-data (POD)** suitable for:
+/// * direct byte-wise copying into GPU buffers,
+/// * use inside GPU storage or uniform buffers,
+/// * round-tripping between CPU and GPU without transformation.
+///
+/// ## Safety
+/// This trait is **unsafe** because incorrect implementations can cause
+/// undefined behavior on the GPU or silent data corruption.
+///
+/// Implementors **must guarantee**:
+/// * The type has **no padding with uninitialized bytes**.
+/// * The memory layout is stable and identical on CPU and GPU.
+/// * The type contains **no pointers, references, or heap allocations**.
+/// * The type is trivially copyable (`Copy`) and has no drop glue.
+/// * The alignment is compatible with GPU storage buffer rules.
+///
+/// ## Example
+/// ```rust
+/// #[repr(C)]
+/// #[derive(Copy, Clone)]
+/// struct Position {
+///     x: f32,
+///     y: f32,
+/// }
+///
+/// unsafe impl GPUPod for Position {}
+
+#[cfg(feature = "gpu")]
+pub unsafe trait GPUPod: Copy + Send + Sync + 'static {}
+
+/// Registers a component type as GPU-safe and eligible for GPU execution.
+///
+/// ## Purpose
+/// This function is a GPU-aware extension of [`register_component`] that
+/// explicitly marks the component as safe to:
+/// * mirror into GPU buffers,
+/// * be bound as a storage buffer in compute shaders,
+///
+/// Internally, this sets the `gpu_usage` flag on the component's
+/// [`ComponentDesc`].
+///
+/// ## Requirements
+/// * The component type must implement [`GPUPod`].
+/// * The component must already satisfy all normal ECS component constraints
+///   (non-zero-sized, `'static`, `Send`, `Sync`).
+///
+/// ## Safety model
+/// This function is safe to call, but relies on the **unsafe contract**
+/// of [`GPUPod`] being upheld by the caller.
+///
+/// ## Freezing behavior
+/// This function must be called **before** [`freeze_components`].
+/// Calling it after the registry is frozen will return an error.
+///
+/// ## Returns
+/// The assigned [`ComponentID`] for the registered component.
+///
+/// ## Errors
+/// Returns an error if:
+/// * the component registry is frozen,
+/// * the registry lock is poisoned,
+/// * the component violates ECS registration constraints.
+
+#[cfg(feature = "gpu")]
+pub fn register_gpu_component<T: GPUPod + 'static + Send + Sync>() -> ECSResult<ComponentID> {
+    let id = register_component::<T>()?;
+
+    let registry = component_registry();
+    let mut registry = registry
+        .write()
+        .map_err(|_| RegistryError::PoisonedLock)?;
+
+    if let Some(slot) = registry.by_id.get_mut(id as usize).and_then(|x| x.as_mut()) {
+        slot.gpu_usage = true;
+    }
+
+    Ok(id)
+}
 
 /// Freezes the global component registry.
 ///
@@ -488,15 +569,25 @@ pub struct ComponentDesc {
     pub size: usize,
 
     /// Alignment of the component type in bytes.
-    pub align: usize
+    pub align: usize,
+
+    /// True if this component is explicitly marked as GPU-safe.
+    pub gpu_usage: bool,
 }
 
 impl ComponentDesc {
 
     /// Creates a descriptor from explicit metadata.    
     #[inline]
-    pub fn new(component_id: ComponentID, name: &'static str, type_id: TypeId, size: usize, align: usize) -> Self {
-        Self { component_id, name, type_id, size, align }
+    pub fn new(
+        component_id: ComponentID, 
+        name: &'static str, 
+        type_id: TypeId, 
+        size: usize, 
+        align: usize,
+        gpu_usage: bool
+    ) -> Self {
+        Self { component_id, name, type_id, size, align, gpu_usage }
     }
 
     /// Constructs a descriptor for type `T` using its `TypeId`, name, size, and alignment.
@@ -512,7 +603,15 @@ impl ComponentDesc {
             type_id: TypeId::of::<T>(),
             size: size_of::<T>(),
             align: align_of::<T>(),
+            gpu_usage: false,
         }
+    }
+
+    /// Marks this component descriptor as GPU-safe.
+    #[inline]
+    pub fn use_gpu(mut self, gpu_usage: bool) -> Self {
+        self.gpu_usage = gpu_usage;
+        self
     }
 
     /// Returns `true` if this descriptor refers to type `T`.
@@ -533,8 +632,8 @@ impl std::fmt::Display for ComponentDesc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ComponentDesc {{ id: {}, name: {}, size: {}, align: {} }}",
-            self.component_id, self.name, self.size, self.align
+            "ComponentDesc {{ id: {}, name: {}, size: {}, align: {}, uses gpu: {} }}",
+            self.component_id, self.name, self.size, self.align, self.gpu_usage
         )
     }
 }

@@ -89,7 +89,14 @@ use std::borrow::Cow;
 use std::fmt;
 use std::any::TypeId;
 
-use crate::engine::types::{ShardID, ChunkID, RowID, ComponentID};
+use crate::engine::types::{
+    ShardID, 
+    ChunkID, 
+    RowID, 
+    ComponentID,
+    ArchetypeID,
+    GPUAccessMode
+};
 
 
 /// Errors from the global component registry and its factories.
@@ -799,6 +806,41 @@ pub enum ExecutionError {
         what: &'static str,
     },
 
+    /// GPU execution requested but crate was built without `--features gpu`.
+    GpuNotEnabled,
+
+    /// Component used by GPU system is not registered as GPU-safe.
+    GpuUnsupportedComponent {
+        /// component ID of the unsupported component.
+        component_id: ComponentID,
+        /// text name of the unsupported component.
+        name: &'static str,
+    },
+
+    /// GPU init failed.
+    GpuInitFailed {
+        /// initialization failure reason.
+        message: std::borrow::Cow<'static, str>,
+    },
+
+    /// GPU dispatch failed.
+    GpuDispatchFailed {
+        /// dispatch failure reason.
+        message: std::borrow::Cow<'static, str>,
+    },
+
+    /// A required GPU buffer was missing during dispatch.
+    GpuMissingBuffer {
+        /// Archetype for which the GPU buffer was requested.
+        archetype_id: ArchetypeID,
+
+        /// Component whose GPU buffer was missing.
+        component_id: ComponentID,
+
+        /// Intended GPU access mode for the missing buffer.
+        access: GPUAccessMode,
+    },
+
     /// Unsafe execution path was invoked incorrectly.
     InternalExecutionError,
 }
@@ -835,6 +877,23 @@ impl fmt::Display for ExecutionError {
             }
 
             ExecutionError::LockPoisoned { what } => write!(f, "lock poisoned: {}", what),
+                        ExecutionError::GpuNotEnabled => {
+                f.write_str("GPU execution requested but the `gpu` feature has not been enabled")
+            }
+            ExecutionError::GpuUnsupportedComponent { component_id, name } => {
+                write!(f, "component {} ({}) is not GPU-safe (register_gpu_component required)", component_id, name)
+            }
+            ExecutionError::GpuInitFailed { message } => write!(f, "GPU initialization failed: {}", message),
+            ExecutionError::GpuDispatchFailed { message } => write!(f, "GPU dispatch failed: {}", message),
+            ExecutionError::GpuMissingBuffer {
+                archetype_id,
+                component_id,
+                access,
+            } => write!(
+                f,
+                "GPU dispatch failed: missing {:?} buffer for component {} in archetype {}",
+                access, component_id, archetype_id
+            ),
             ExecutionError::InternalExecutionError => f.write_str("internal ECS execution error"),
             
         }
