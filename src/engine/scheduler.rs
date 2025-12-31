@@ -286,9 +286,13 @@ impl Scheduler {
                 }
 
                 StageType::CPU => {
-                    stage.system_indices.par_iter().try_for_each(|&i| self.systems[i].run(ecs))?;
+                    stage.system_indices
+                        .par_iter()
+                        .try_for_each(|&i| self.systems[i].run(ecs))?;
+
                     ecs.clear_borrows();
                 }
+
 
                 StageType::GPU => {
                     if stage.system_indices.len() != 1 {

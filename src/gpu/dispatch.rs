@@ -167,7 +167,7 @@ pub fn execute_gpu_system(
 
             {
                 let Runtime { context, mirror, pipelines: _ } = &mut *run_time;
-                mirror.upload_signature(&*context, archetypes, &union)?;
+                mirror.upload_signature_dirty_chunks(&*context, archetypes, &union, data.gpu_dirty_chunks())?;
             }
 
             dispatch_over_archetypes(&mut *run_time, system.id(), gpu, archetypes, &access)?;

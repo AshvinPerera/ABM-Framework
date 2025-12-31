@@ -98,6 +98,8 @@ use crate::engine::error::{
     SpawnError
 };
 
+#[cfg(feature = "gpu")]
+use crate::engine::dirty::DirtyChunks;
 
 
 /// Per-archetype precomputed view into chunk memory.
@@ -761,6 +763,10 @@ pub struct ECSData {
     shards: EntityShards,
 
     next_spawn_shard: ShardID,
+
+    /// Chunk-level dirty tracking for CPU writes.
+    #[cfg(feature = "gpu")]
+    gpu_dirty_chunks: DirtyChunks,    
 }
 
 impl ECSData {
@@ -779,6 +785,9 @@ impl ECSData {
             signature_map: HashMap::new(),
             shards,
             next_spawn_shard: 0,
+
+            #[cfg(feature = "gpu")]
+            gpu_dirty_chunks: DirtyChunks::new(),
         }
     }
 
@@ -787,6 +796,13 @@ impl ECSData {
         let shard = self.next_spawn_shard;
         self.next_spawn_shard = (self.next_spawn_shard + 1) % (self.shards.shard_count() as u16);
         shard
+    }
+
+    #[cfg(feature = "gpu")]
+    /// Returns GPU dirty chunks 
+    #[inline]
+    pub fn gpu_dirty_chunks(&self) -> &DirtyChunks {
+        &self.gpu_dirty_chunks
     }
 
     /// Returns mutable references to two distinct archetypes.
@@ -1084,6 +1100,12 @@ impl ECSData {
             }
         }
 
+        #[cfg(feature = "gpu")]
+        {
+            // Structural changes invalidate all prior dirty tracking.
+            self.gpu_dirty_chunks.notify_world_changed();
+        }
+
         Ok(())
     }
 
@@ -1215,6 +1237,16 @@ impl ECSData {
             let grainsize = (views.chunk_count / threads).max(8);
             let views_ref = &views;
 
+            #[cfg(feature = "gpu")]
+            let dirty = self.gpu_dirty_chunks();
+
+            #[cfg(feature = "gpu")]
+            let archetype_id: ArchetypeID = matched_archetype.archetype_id;
+
+            #[cfg(feature = "gpu")]
+            let write_component_ids: std::sync::Arc<Vec<ComponentID>> =
+                std::sync::Arc::new(query.writes.clone());
+
             rayon::scope(|s| {
                 let mut start = 0usize;
                 while start < views_ref.chunk_count {
@@ -1224,6 +1256,9 @@ impl ECSData {
                     let err = err.clone();
                     let f = f.clone();
                     let views = views_ref;
+
+                    #[cfg(feature = "gpu")]
+                    let write_component_ids = write_component_ids.clone();
 
                     s.spawn(move |_| {
                         let mut read_views: Vec<&[u8]> = Vec::with_capacity(views.n_reads);
@@ -1269,6 +1304,16 @@ impl ECSData {
                                     return;
                                 }
                                 unsafe { write_views.push(std::slice::from_raw_parts_mut(ptr, bytes)); }
+                            }
+
+                            // Mark dirty chunks for all write components touched by this query.
+                            #[cfg(feature = "gpu")]
+                            {
+                                if views.n_writes != 0 {
+                                    for &component_id in write_component_ids.as_slice() {
+                                        dirty.mark_chunk_dirty(archetype_id, component_id, chunk, views.chunk_count);
+                                    }
+                                }
                             }
 
                             // Call user callback

@@ -103,4 +103,6 @@ mod pipeline;
 mod layout;
 mod dispatch;
 
-pub use dispatch::execute_gpu_system;
+pub use dispatch::{
+    execute_gpu_system
+};
