@@ -101,6 +101,12 @@ use crate::engine::error::{
 #[cfg(feature = "gpu")]
 use crate::engine::dirty::DirtyChunks;
 
+#[cfg(feature = "gpu")]
+use crate::engine::types::GPUResourceID;
+
+#[cfg(feature = "gpu")]
+use crate::gpu::{GPUResource, GPUResourceRegistry};
+
 
 /// Per-archetype precomputed view into chunk memory.
 ///
@@ -465,6 +471,15 @@ impl<'a> ECSReference<'a> {
         data.reduce_abstraction_unchecked(query, init, fold_chunk, combine)
             .map_err(ECSError::from)
     }   
+
+    /// Registers a world-owned GPU resource.
+    #[cfg(feature = "gpu")]
+    pub fn register_gpu_resource<R: GPUResource + 'static>(
+        &self,
+        r: R,
+    ) -> ECSResult<GPUResourceID> {
+        self.with_exclusive(|data| Ok(data.register_gpu_resource(r)))
+    }    
 }
 
 impl ECSReference<'_> {
@@ -805,6 +820,9 @@ pub struct ECSData {
     /// Chunk-level dirty tracking for CPU writes.
     #[cfg(feature = "gpu")]
     gpu_dirty_chunks: DirtyChunks,    
+
+    #[cfg(feature = "gpu")]
+    gpu_resources: GPUResourceRegistry,
 }
 
 impl ECSData {
@@ -826,6 +844,9 @@ impl ECSData {
 
             #[cfg(feature = "gpu")]
             gpu_dirty_chunks: DirtyChunks::new(),
+
+            #[cfg(feature = "gpu")]
+            gpu_resources: GPUResourceRegistry::new(),
         }
     }
 
@@ -1573,5 +1594,47 @@ impl ECSData {
     #[inline]
     pub(crate) fn archetypes_mut(&mut self) -> &mut [Archetype] {
         &mut self.archetypes
+    }
+
+    /// Registers a world-owned GPU resource with the ECS world.
+    ///
+    /// ## Semantics
+    /// * The resource becomes owned by the ECS world for its entire lifetime.
+    /// * GPU buffers are created lazily when the GPU runtime is initialized.
+    ///
+    /// ## Returns
+    /// A stable `GPUResourceID` that can be referenced by GPU systems.
+
+    #[cfg(feature = "gpu")]
+    pub fn register_gpu_resource<R: GPUResource + 'static>(&mut self, r: R) -> GPUResourceID {
+        self.gpu_resources.register(r)
+    }
+
+    /// Returns an immutable view of the GPU resource registry.
+    ///
+    /// ## Purpose
+    /// Intended for GPU dispatch and scheduling logic that needs to:
+    /// * resolve resource bindings,
+    /// * inspect resource layouts,
+    /// * or build GPU bind groups.
+
+    #[cfg(feature = "gpu")]
+    #[inline]
+    pub fn gpu_resources(&self) -> &GPUResourceRegistry {
+        &self.gpu_resources
+    }
+
+    /// Returns a mutable view of the GPU resource registry.
+    ///
+    /// ## Purpose
+    /// Allows controlled mutation of GPU resource state, including:
+    /// * marking CPU-side data dirty,
+    /// * marking pending GPU to CPU downloads,
+    /// * performing explicit upload/download synchronization.
+
+    #[cfg(feature = "gpu")]
+    #[inline]
+    pub fn gpu_resources_mut(&mut self) -> &mut GPUResourceRegistry {
+        &mut self.gpu_resources
     }
 }

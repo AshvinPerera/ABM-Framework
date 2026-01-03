@@ -46,42 +46,26 @@
 
 #![cfg(feature = "gpu")]
 
-use std::sync::{OnceLock, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::engine::archetype::Archetype;
 use crate::engine::component::Signature;
-use crate::engine::error::{ECSResult, ECSError, ExecutionError};
+use crate::engine::error::{ECSError, ECSResult, ExecutionError};
 use crate::engine::manager::ECSReference;
-use crate::engine::systems::{System, GpuSystem};
-use crate::engine::types::{GPUAccessMode};
+use crate::engine::systems::{GpuSystem, System};
+use crate::engine::types::GPUAccessMode;
 
-use crate::gpu::context::GPUContext;
 use crate::gpu::mirror::Mirror;
 use crate::gpu::pipeline::PipelineCache;
-
-
-/// Internal GPU runtime state.
-///
-/// ## Role
-/// Bundles all long-lived GPU backend state required to execute ECS GPU systems:
-/// * the GPU device and queue,
-/// * the ECS GPU buffer mirror,
-/// * and the compute pipeline cache.
-///
-/// ## Lifetime
-/// Constructed lazily on first GPU system execution and stored globally.
-///
-/// ## Synchronization
-/// Access to the runtime is serialized via a global `Mutex`. This ensures:
-/// * pipelines are created deterministically,
-/// * GPU buffer reuse is safe,
-/// * device usage is ordered.
+use crate::gpu::GPUContext;
+use crate::gpu::GPUResourceRegistry;
 
 struct Runtime {
     context: GPUContext,
     mirror: Mirror,
     pipelines: PipelineCache,
     pending_download: Signature,
+    params_buffer: Option<wgpu::Buffer>,
 }
 
 impl Runtime {
@@ -98,19 +82,6 @@ impl Runtime {
 
 static RUNTIME: OnceLock<ECSResult<Mutex<Runtime>>> = OnceLock::new();
 
-/// Lazily initializes and returns the global GPU runtime.
-///
-/// ## Semantics
-/// * On first access, initializes the GPU device, buffer mirror, and pipeline cache.
-/// * Subsequent calls reuse the same runtime instance.
-///
-/// ## Error handling
-/// * GPU initialization errors are cached and rethrown on every access.
-/// * Mutex poisoning is reported as an ECS execution error.
-///
-/// ## Thread safety
-/// Serialized via `Mutex`; safe for use across scheduler threads.
-
 fn runtime() -> ECSResult<MutexGuard<'static, Runtime>> {
     let cell: &ECSResult<Mutex<Runtime>> = RUNTIME.get_or_init(|| {
         let run_time = Runtime {
@@ -118,6 +89,7 @@ fn runtime() -> ECSResult<MutexGuard<'static, Runtime>> {
             mirror: Mirror::new(),
             pipelines: PipelineCache::new(),
             pending_download: Signature::default(),
+            params_buffer: None,
         };
         Ok(Mutex::new(run_time))
     });
@@ -131,17 +103,19 @@ fn runtime() -> ECSResult<MutexGuard<'static, Runtime>> {
         }
     };
 
-    mutex.lock().map_err(|_| {
-        ECSError::from(ExecutionError::LockPoisoned { what: "gpu runtime" })
-    })
+    mutex
+        .lock()
+        .map_err(|_| ECSError::from(ExecutionError::LockPoisoned { what: "gpu runtime" }))
 }
 
-/// Barrier that makes CPU storage consistent by downloading all pending GPU writes.
+/// Synchronize any pending GPU downloads into ECS storage.
 pub fn sync_pending_to_cpu(ecs: ECSReference<'_>) -> ECSResult<()> {
     ecs.with_exclusive(|data| {
         let mut run_time = runtime()?;
 
-        // Extract pending signature
+        data.gpu_resources_mut().ensure_created(&run_time.context)?;
+        data.gpu_resources_mut().download_pending(&run_time.context)?;
+
         let pending = {
             let p = run_time.pending_download.clone();
             if is_signature_empty(&p) {
@@ -150,43 +124,16 @@ pub fn sync_pending_to_cpu(ecs: ECSReference<'_>) -> ECSResult<()> {
             p
         };
 
-        // Download pending GPU writes
         let archetypes_mut: &mut [Archetype] = data.archetypes_mut();
         run_time.download_pending_into(archetypes_mut, &pending)?;
 
-        // Clear pending set
         run_time.pending_download = Signature::default();
 
         Ok(())
     })
 }
 
-
-
-/// Executes a GPU-backed ECS system.
-///
-/// ## Role
-/// This function is the **scheduler-facing entry point** for GPU systems.
-/// It bridges ECS execution semantics with GPU compute dispatch.
-///
-/// ## Execution guarantees
-/// * Runs with exclusive ECS access.
-/// * Prevents structural mutation and parallel iteration.
-/// * Ensures GPU-visible data is consistent with ECS storage.
-///
-/// ## Steps
-/// 1. Compute read/write access signatures.
-/// 2. Upload required components to GPU buffers.
-/// 3. Dispatch compute workloads per matching archetype.
-/// 4. Download mutated components back into ECS storage.
-///
-/// ## Errors
-/// Returns an error if:
-/// * GPU initialization fails,
-/// * required component buffers are missing,
-/// * pipeline compilation fails,
-/// * GPU execution or synchronization fails.
-
+/// Executes a single GPU-backed ECS system with exclusive world access.
 pub fn execute_gpu_system(
     ecs: ECSReference<'_>,
     system: &dyn System,
@@ -201,49 +148,43 @@ pub fn execute_gpu_system(
 
         let mut run_time = runtime()?;
 
-        // Upload only dirty chunks, then dispatch.
+        data.gpu_resources_mut().ensure_created(&run_time.context)?;
+        data.gpu_resources_mut().upload_dirty(&run_time.context)?;
+
         {
             let archetypes: &[Archetype] = data.archetypes();
 
             {
                 let Runtime { context, mirror, .. } = &mut *run_time;
-                mirror.upload_signature_dirty_chunks(
-                    &*context,
-                    archetypes,
-                    &union,
-                    data.gpu_dirty_chunks(),
-                )?;
+                mirror.upload_signature_dirty_chunks(&*context, archetypes, &union, data.gpu_dirty_chunks())?;
             }
 
-            dispatch_over_archetypes(&mut *run_time, system.id(), gpu, archetypes, &access)?;
+            dispatch_over_archetypes(
+                &mut *run_time,
+                system.id(),
+                gpu,
+                archetypes,
+                &access,
+                data.gpu_resources(),
+            )?;
         }
 
         or_signature_in_place(&mut run_time.pending_download, write_signature);
 
+        let writes = gpu.writes_resources();
+        if !writes.is_empty() {
+            for &resource_id in writes {
+                data.gpu_resources_mut().mark_pending_download(resource_id);
+            }
+        } else {
+            for &resource_id in gpu.uses_resources() {
+                data.gpu_resources_mut().mark_pending_download(resource_id);
+            }
+        }
+
         Ok(())
     })
 }
-
-/// Dispatches a GPU system over all matching archetypes.
-///
-/// ## Semantics
-/// * Filters archetypes by required read/write signatures.
-/// * Builds bind groups dynamically per archetype.
-/// * Dispatches compute workloads sized to entity count.
-///
-/// ## Binding layout
-/// Bindings are assigned in the following order:
-/// 1. Read component buffers
-/// 2. Write component buffers
-/// 3. Uniform parameter buffer (`entity_len`)
-///
-/// ## Workgroup sizing
-/// * Workgroup size is defined by the `GpuSystem`.
-/// * Dispatch count is computed as `ceil(entity_len / workgroup_size)`.
-///
-/// ## Synchronization
-/// GPU execution is synchronized after each archetype dispatch to ensure
-/// correctness before subsequent uploads/downloads.
 
 fn dispatch_over_archetypes(
     run_time: &mut Runtime,
@@ -251,33 +192,36 @@ fn dispatch_over_archetypes(
     gpu: &dyn GpuSystem,
     archetypes: &[Archetype],
     access: &crate::engine::systems::AccessSets,
+    gpu_resources: &GPUResourceRegistry,
 ) -> ECSResult<()> {
-    use wgpu::util::DeviceExt;
+    let mut resource_ids: Vec<_> = gpu.uses_resources().to_vec();
+    resource_ids.sort_unstable();
+    let resource_layout = gpu_resources.flattened_binding_descs(&resource_ids);
 
     let mut reads: Vec<crate::engine::types::ComponentID> =
         crate::engine::component::iter_bits_from_words(&access.read.components).collect();
     let mut writes: Vec<crate::engine::types::ComponentID> =
         crate::engine::component::iter_bits_from_words(&access.write.components).collect();
-    reads.sort_unstable();
+    
     writes.sort_unstable();
+    reads.retain(|component_id| writes.binary_search(component_id).is_err());      
+    reads.sort_unstable();
 
     let read_count = reads.len();
     let write_count = writes.len();
-    let binding_count = read_count + write_count + 1;
 
-    let (pipeline, bind_group_layout) = run_time.pipelines.get_or_create(
+    let (pipeline, bgl0, bgl1_opt) = run_time.pipelines.get_or_create(
         &run_time.context,
         system_id,
         gpu.shader(),
         gpu.entry_point(),
         read_count,
         write_count,
+        &resource_layout,
     )?;
 
     for archetype in archetypes {
-        if !archetype.signature().contains_all(&access.read)
-            || !archetype.signature().contains_all(&access.write)
-        {
+        if !archetype.signature().contains_all(&access.read) || !archetype.signature().contains_all(&access.write) {
             continue;
         }
 
@@ -286,7 +230,7 @@ fn dispatch_over_archetypes(
             continue;
         }
 
-        let mut entries: Vec<wgpu::BindGroupEntry> = Vec::with_capacity(binding_count);
+        let mut entries0: Vec<wgpu::BindGroupEntry> = Vec::with_capacity(read_count + write_count + 1);
 
         for (i, &component_id) in reads.iter().enumerate() {
             let archetype_id = archetype.archetype_id();
@@ -302,7 +246,7 @@ fn dispatch_over_archetypes(
                     })
                 })?;
 
-            entries.push(wgpu::BindGroupEntry {
+            entries0.push(wgpu::BindGroupEntry {
                 binding: i as u32,
                 resource: buffer.as_entire_binding(),
             });
@@ -323,7 +267,7 @@ fn dispatch_over_archetypes(
                     })
                 })?;
 
-            entries.push(wgpu::BindGroupEntry {
+            entries0.push(wgpu::BindGroupEntry {
                 binding: (base + j) as u32,
                 resource: buffer.as_entire_binding(),
             });
@@ -337,7 +281,7 @@ fn dispatch_over_archetypes(
             _p1: u32,
             _p2: u32,
         }
-        
+
         unsafe impl bytemuck::Pod for Params {}
         unsafe impl bytemuck::Zeroable for Params {}
 
@@ -348,30 +292,85 @@ fn dispatch_over_archetypes(
             _p2: 0,
         };
 
-        let parameter_buffer = run_time.context.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("abm_params"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            },
+        let params_size = std::mem::size_of::<Params>() as u64;
+        let recreate = match run_time.params_buffer.as_ref() {
+            Some(buf) => buf.size() < params_size,
+            None => true,
+        };
+
+        if recreate {
+            run_time.params_buffer = Some(
+                run_time.context.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("abm_params"),
+                    size: params_size,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+            );
+        }
+
+        let params_buf = run_time.params_buffer.as_ref().unwrap();
+
+        // Update contents safely
+        run_time
+            .context
+            .queue
+            .write_buffer(params_buf, 0, bytemuck::bytes_of(&params));
+
+        // Bind params buffer
+        entries0.push(wgpu::BindGroupEntry {
+            binding: (read_count + write_count) as u32,
+            resource: params_buf.as_entire_binding(),
+        });
+
+        let bind_group0 = run_time.context.device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                label: Some("abm_bind_group_group0"),
+                layout: bgl0,
+                entries: &entries0,
+            }
         );
 
-        entries.push(wgpu::BindGroupEntry {
-            binding: (binding_count - 1) as u32,
-            resource: parameter_buffer.as_entire_binding(),
-        });
+        let bind_group1 = if let Some(bgl1) = bgl1_opt {
+            let mut entries1: Vec<wgpu::BindGroupEntry> =
+                Vec::with_capacity(resource_layout.len());
 
-        let bind_group = run_time.context.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("abm_bind_group"),
-            layout: bind_group_layout,
-            entries: &entries,
-        });
+            gpu_resources.append_bind_group_entries(
+                &resource_ids,
+                0,
+                &mut entries1,
+            )?;
 
-        let mut encoder = run_time.context.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor {
+            println!("params_buf ptr = {:p}", params_buf);
+
+            for e in &entries1 {
+                if let wgpu::BindingResource::Buffer(b) = &e.resource {
+                    println!(
+                        "group1 binding={} buf_ptr={:p} usage={:?}",
+                        e.binding,
+                        b.buffer,
+                        b.buffer.usage(),
+                    );
+                }
+            }
+            
+            println!("params_buf usage = {:?}", params_buf.usage());
+
+            Some(run_time.context.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("abm_bind_group_group1"),
+                layout: bgl1,
+                entries: &entries1,
+            }))
+        } else {
+            None
+        };
+
+        let mut encoder = run_time
+            .context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("abm_compute_encoder"),
-            },
-        );
+            });
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -380,7 +379,10 @@ fn dispatch_over_archetypes(
             });
 
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, &bind_group0, &[]);
+            if let Some(bg1) = &bind_group1 {
+                pass.set_bind_group(1, bg1, &[]);
+            }
 
             let work_group_size = gpu.workgroup_size().max(1);
             let groups = (entity_len + work_group_size - 1) / work_group_size;
@@ -404,12 +406,6 @@ fn dispatch_over_archetypes(
 
     Ok(())
 }
-
-/// Computes the union of two component signatures.
-///
-/// ## Purpose
-/// Used to determine which components must be uploaded to the GPU when a system
-/// reads and writes different component sets.
 
 fn union_signatures(a: &Signature, b: &Signature) -> Signature {
     let mut out = Signature::default();

@@ -18,6 +18,10 @@ proptest = "1.9.0"
 insta = { version = "1.45.1", features = ["json"] }
 criterion = "0.8.1"
 
+wgpu = "27.0.1"
+bytemuck = { version = "1.16", features = ["derive"] }
+pollster = "0.4.0"
+
 [features]
 default = []
 rollback = []
