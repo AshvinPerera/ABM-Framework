@@ -67,7 +67,10 @@ use crate::engine::error::{ECSResult, ECSError, ExecutionError};
 
 #[derive(Debug)]
 pub struct GPUContext {
+    /// The GPU device used for GPU path execution
     pub device: wgpu::Device,
+    
+    /// The command queue for the GPU
     pub queue: wgpu::Queue,
 }
 
