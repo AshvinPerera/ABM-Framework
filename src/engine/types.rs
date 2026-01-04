@@ -116,3 +116,16 @@ pub type ComponentID = u16;
 pub const COMPONENT_CAP: usize = 4096;
 /// Number of `u64` words required to represent a full component signature.
 pub const SIGNATURE_SIZE: usize = (COMPONENT_CAP + 63) / 64;
+
+/// Unique identifier for a GPU resource.
+#[cfg(feature = "gpu")]
+pub type GPUResourceID = u16;
+
+/// Declares how a component buffer is accessed during GPU execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GPUAccessMode {
+    /// Read-only access to a component buffer.
+    Read,
+    /// Read-write (mutable) access to a component buffer.
+    Write,
+}

@@ -68,6 +68,8 @@
 //!
 //! Together, these components form the execution layer of the ECS.
 
+#[cfg(feature = "gpu")]
+use crate::engine::types::GPUResourceID;
 use crate::engine::types::{SystemID};
 use crate::engine::component::{Signature};
 use crate::engine::manager::ECSReference;
@@ -109,8 +111,29 @@ impl AccessSets {
 pub enum SystemBackend {
     /// Standard Rust / Rayon execution on CPU.
     CPU,
-    /// Placeholder for future GPU dispatch.
+    /// GPU dispatch.
     GPU
+}
+
+/// GPU capability trait (feature-gated).
+/// A GPU system is still a `System`, but additionally provides WGSL.
+
+#[cfg(feature = "gpu")]
+pub trait GpuSystem {
+    /// WGSL source
+    fn shader(&self) -> &'static str;
+
+    /// Entry point name (default "main")
+    fn entry_point(&self) -> &'static str { "main" }
+
+    /// Workgroup size (default 256)
+    fn workgroup_size(&self) -> u32 { 256 }
+
+    /// GPU resources read or used by this kernel.
+    fn uses_resources(&self) -> &[GPUResourceID] { &[] }
+
+    /// GPU resources that this kernel may write.
+    fn writes_resources(&self) -> &[GPUResourceID] { &[] }
 }
 
 /// A unit of executable logic operating on the ECS world.
@@ -139,6 +162,16 @@ pub trait System: Send + Sync {
 
     /// Executes the system logic against the ECS world.
     fn run(&self, world: ECSReference<'_>) -> ECSResult<()>;
+
+    /// GPU capability hook.
+    /// A GPU system should override this to return `Some(self)` (as `&dyn GpuSystem`)
+    /// and also return `SystemBackend::GPU` from `backend()`.
+    #[cfg(feature = "gpu")]
+    #[inline]
+    fn gpu(&self) -> Option<&dyn GpuSystem> {
+        None
+    }
+    
 }
 
 /// A concrete [`System`] backed by a function or closure.
