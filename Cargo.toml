@@ -18,6 +18,10 @@ proptest = "1.9.0"
 insta = { version = "1.45.1", features = ["json"] }
 criterion = "0.8.1"
 
+wgpu = "27.0.1"
+bytemuck = { version = "1.16", features = ["derive"] }
+pollster = "0.4.0"
+
 [features]
 default = []
 rollback = []
@@ -26,3 +30,30 @@ gpu = ["wgpu", "bytemuck", "pollster"]
 [[bench]]
 name = "spawn"
 harness = false
+
+[[bench]]
+name = "iterate"
+harness = false
+
+[[bench]]
+name = "tick"
+harness = false
+
+[[bench]]
+name = "reduce"
+harness = false
+
+[[bench]]
+name = "gpu_startup"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "gpu_dispatch"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "gpu_tick"
+harness = false
+required-features = ["gpu"]

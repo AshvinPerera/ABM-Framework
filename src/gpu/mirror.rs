@@ -10,7 +10,7 @@ use crate::engine::types::{ArchetypeID, ComponentID, ChunkID};
 #[cfg(feature = "gpu")]
 use crate::engine::dirty::DirtyChunks;
 
-use crate::gpu::context::GPUContext;
+use crate::gpu::GPUContext;
 
 
 #[inline]
@@ -110,15 +110,16 @@ impl Mirror {
         };
 
         if recreate {
+            let label = format!("abm_component_storage[a{} c{}]", archetype, component_id);
+
             let buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("abm_component_storage"),
+                label: Some(&label),
                 size: bytes as u64,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-
             self.buffers.insert(key, BufferEntry {
                 buffer,
                 bytes

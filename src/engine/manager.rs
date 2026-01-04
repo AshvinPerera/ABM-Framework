@@ -101,6 +101,12 @@ use crate::engine::error::{
 #[cfg(feature = "gpu")]
 use crate::engine::dirty::DirtyChunks;
 
+#[cfg(feature = "gpu")]
+use crate::engine::types::GPUResourceID;
+
+#[cfg(feature = "gpu")]
+use crate::gpu::{GPUResource, GPUResourceRegistry};
+
 
 /// Per-archetype precomputed view into chunk memory.
 ///
@@ -402,10 +408,10 @@ impl<'a> ECSReference<'a> {
     ///
     /// ## Execution model
     /// The reduction proceeds in two phases:
-    /// 1. **Parallel accumulation** — each worker thread processes a disjoint
+    /// 1. **Parallel accumulation** - each worker thread processes a disjoint
     ///    subset of archetype chunks and accumulates results into a thread-local
     ///    accumulator of type `R`.
-    /// 2. **Deterministic combination** — all partial results are combined
+    /// 2. **Deterministic combination** - all partial results are combined
     ///    serially using the provided `combine` function to produce the final
     ///    result.
     ///
@@ -419,11 +425,11 @@ impl<'a> ECSReference<'a> {
     /// a reduction. Queries containing write components will be rejected.
     ///
     /// ## Parameters
-    /// * `query` — A built ECS query specifying which components to read.
-    /// * `init` — Constructs a fresh accumulator value for each worker thread.
-    /// * `fold_chunk` — Updates an accumulator using the raw component slices
+    /// * `query` - A built ECS query specifying which components to read.
+    /// * `init` - Constructs a fresh accumulator value for each worker thread.
+    /// * `fold_chunk` - Updates an accumulator using the raw component slices
     ///   for a single chunk.
-    /// * `combine` — Merges two accumulator values; must be associative.
+    /// * `combine` - Merges two accumulator values; must be associative.
     ///
     /// ## Determinism
     /// Partial results are combined in a deterministic order independent of
@@ -465,6 +471,15 @@ impl<'a> ECSReference<'a> {
         data.reduce_abstraction_unchecked(query, init, fold_chunk, combine)
             .map_err(ECSError::from)
     }   
+
+    /// Registers a world-owned GPU resource.
+    #[cfg(feature = "gpu")]
+    pub fn register_gpu_resource<R: GPUResource + 'static>(
+        &self,
+        r: R,
+    ) -> ECSResult<GPUResourceID> {
+        self.with_exclusive(|data| Ok(data.register_gpu_resource(r)))
+    }    
 }
 
 impl ECSReference<'_> {
@@ -554,6 +569,40 @@ impl ECSReference<'_> {
 
             for i in 0..a.len() {
                 f(&a[i], &b[i]);
+            }
+        })
+    }
+
+    /// Executes a parallel iteration over three read-only components.
+    pub fn for_each_read3<A, B, C>(
+        &self,
+        query: BuiltQuery,
+        f: impl Fn(&A, &B, &C) + Send + Sync,
+    ) -> ECSResult<()>
+    where
+        A: 'static + Send + Sync,
+        B: 'static + Send + Sync,
+        C: 'static + Send + Sync,
+    {
+        if query.reads.len() != 3 || !query.writes.is_empty() {
+            return Err(ECSError::Internal(
+                "for_each_read3: expected exactly 3 reads and 0 writes".into(),
+            ));
+        }
+
+        self.for_each_abstraction(query, move |reads, _| unsafe {
+            let a =
+                crate::engine::storage::cast_slice::<A>(reads[0].as_ptr(), reads[0].len());
+            let b =
+                crate::engine::storage::cast_slice::<B>(reads[1].as_ptr(), reads[1].len());
+            let c =
+                crate::engine::storage::cast_slice::<C>(reads[2].as_ptr(), reads[2].len());
+
+            debug_assert_eq!(a.len(), b.len());
+            debug_assert_eq!(a.len(), c.len());
+
+            for i in 0..a.len() {
+                f(&a[i], &b[i], &c[i]);
             }
         })
     }
@@ -690,10 +739,10 @@ impl ECSReference<'_> {
     /// The query must specify **exactly one read component** and no writes.
     ///
     /// ## Parameters
-    /// * `query` — A built query reading exactly one component of type `A`.
-    /// * `init` — Constructs a fresh accumulator for each worker thread.
-    /// * `fold` — Updates the accumulator for each entity.
-    /// * `combine` — Merges two accumulator values; must be associative.
+    /// * `query` - A built query reading exactly one component of type `A`.
+    /// * `init` - Constructs a fresh accumulator for each worker thread.
+    /// * `fold` - Updates the accumulator for each entity.
+    /// * `combine` - Merges two accumulator values; must be associative.
     ///
     /// ## Typical use cases
     /// * Counting entities
@@ -805,6 +854,9 @@ pub struct ECSData {
     /// Chunk-level dirty tracking for CPU writes.
     #[cfg(feature = "gpu")]
     gpu_dirty_chunks: DirtyChunks,    
+
+    #[cfg(feature = "gpu")]
+    gpu_resources: GPUResourceRegistry,
 }
 
 impl ECSData {
@@ -826,6 +878,9 @@ impl ECSData {
 
             #[cfg(feature = "gpu")]
             gpu_dirty_chunks: DirtyChunks::new(),
+
+            #[cfg(feature = "gpu")]
+            gpu_resources: GPUResourceRegistry::new(),
         }
     }
 
@@ -924,9 +979,9 @@ impl ECSData {
     /// any operation.
     ///
     /// ### Parameters
-    /// * `entity` — The entity to which the component should be added.
-    /// * `added_component_id` — The component type identifier to add.
-    /// * `added_value` — The concrete component value, type-erased as `Box<dyn Any>`.
+    /// * `entity` - The entity to which the component should be added.
+    /// * `added_component_id` - The component type identifier to add.
+    /// * `added_value` - The concrete component value, type-erased as `Box<dyn Any>`.
     ///   The dynamic type **must match** the registered type of `added_component_id`.
     ///
     /// ### Safety and correctness notes
@@ -1573,5 +1628,47 @@ impl ECSData {
     #[inline]
     pub(crate) fn archetypes_mut(&mut self) -> &mut [Archetype] {
         &mut self.archetypes
+    }
+
+    /// Registers a world-owned GPU resource with the ECS world.
+    ///
+    /// ## Semantics
+    /// * The resource becomes owned by the ECS world for its entire lifetime.
+    /// * GPU buffers are created lazily when the GPU runtime is initialized.
+    ///
+    /// ## Returns
+    /// A stable `GPUResourceID` that can be referenced by GPU systems.
+
+    #[cfg(feature = "gpu")]
+    pub fn register_gpu_resource<R: GPUResource + 'static>(&mut self, r: R) -> GPUResourceID {
+        self.gpu_resources.register(r)
+    }
+
+    /// Returns an immutable view of the GPU resource registry.
+    ///
+    /// ## Purpose
+    /// Intended for GPU dispatch and scheduling logic that needs to:
+    /// * resolve resource bindings,
+    /// * inspect resource layouts,
+    /// * or build GPU bind groups.
+
+    #[cfg(feature = "gpu")]
+    #[inline]
+    pub fn gpu_resources(&self) -> &GPUResourceRegistry {
+        &self.gpu_resources
+    }
+
+    /// Returns a mutable view of the GPU resource registry.
+    ///
+    /// ## Purpose
+    /// Allows controlled mutation of GPU resource state, including:
+    /// * marking CPU-side data dirty,
+    /// * marking pending GPU to CPU downloads,
+    /// * performing explicit upload/download synchronization.
+
+    #[cfg(feature = "gpu")]
+    #[inline]
+    pub fn gpu_resources_mut(&mut self) -> &mut GPUResourceRegistry {
+        &mut self.gpu_resources
     }
 }

@@ -48,11 +48,11 @@
 //!
 //! ## Module structure
 //!
-//! * [`context`] — GPU device and queue initialization
-//! * [`mirror`] — Host to GPU buffer mirroring for component columns
-//! * [`pipeline`] — Compute pipeline creation and caching
-//! * [`layout`] — Bind group layout construction for component access
-//! * [`dispatch`] — System execution orchestration
+//! * [`context`] - GPU device and queue initialization
+//! * [`mirror`] - Host to GPU buffer mirroring for component columns
+//! * [`pipeline`] - Compute pipeline creation and caching
+//! * [`layout`] - Bind group layout construction for component access
+//! * [`dispatch`] - System execution orchestration
 //!
 //! Only the high-level entry point is exposed publicly.
 //!
@@ -89,7 +89,7 @@
 //!
 //! ## Public API
 //!
-//! * [`execute_gpu_system`] — Executes a single ECS system using the GPU backend
+//! * [`execute_gpu_system`] - Executes a single ECS system using the GPU backend
 //!
 //! This function is invoked by the scheduler when a system is marked
 //! for GPU execution.
@@ -100,10 +100,18 @@
 mod context;
 mod mirror;
 mod pipeline;
-mod layout;
 mod dispatch;
+mod resource;
+
+pub use context::GPUContext;
 
 pub use dispatch::{
     execute_gpu_system,
     sync_pending_to_cpu
+};
+
+pub use resource::{
+    GPUResource,
+    GPUBindingDesc,
+    GPUResourceRegistry
 };

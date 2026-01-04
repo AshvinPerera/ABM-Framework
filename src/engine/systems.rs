@@ -68,6 +68,8 @@
 //!
 //! Together, these components form the execution layer of the ECS.
 
+#[cfg(feature = "gpu")]
+use crate::engine::types::GPUResourceID;
 use crate::engine::types::{SystemID};
 use crate::engine::component::{Signature};
 use crate::engine::manager::ECSReference;
@@ -126,6 +128,12 @@ pub trait GpuSystem {
 
     /// Workgroup size (default 256)
     fn workgroup_size(&self) -> u32 { 256 }
+
+    /// GPU resources read or used by this kernel.
+    fn uses_resources(&self) -> &[GPUResourceID] { &[] }
+
+    /// GPU resources that this kernel may write.
+    fn writes_resources(&self) -> &[GPUResourceID] { &[] }
 }
 
 /// A unit of executable logic operating on the ECS world.
